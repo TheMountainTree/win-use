@@ -1,0 +1,2 @@
+[console_scripts]
+win-use = win_use.cli:main

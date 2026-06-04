@@ -1,0 +1,46 @@
+{
+  "default_timeout": 5,
+  "default_settle": 0.05,
+  "steps": [
+    {
+      "action": "apps.maximize",
+      "name": "Weixin"
+    },
+    {
+      "action": "apps.focus",
+      "name": "Weixin"
+    },
+    {
+      "action": "keys",
+      "keys": "{Ctrl}f"
+    },
+    {
+      "action": "type",
+      "text": "长夜无荒",
+      "delay": 0
+    },
+    {
+      "action": "click",
+      "window": "Weixin",
+      "selector": {
+        "name": "长夜无荒",
+        "match": "contains",
+        "visible": true
+      },
+      "timeout": 5
+    },
+    {
+      "action": "type",
+      "text": "你好",
+      "delay": 0
+    },
+    {
+      "action": "keys",
+      "keys": "{Enter}"
+    },
+    {
+      "action": "screenshot",
+      "output": "wechat_result.png"
+    }
+  ]
+}

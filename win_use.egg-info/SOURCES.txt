@@ -1,0 +1,14 @@
+setup.py
+win_use/__init__.py
+win_use/actions.py
+win_use/apps.py
+win_use/cli.py
+win_use/reader.py
+win_use/screen.py
+win_use/utils.py
+win_use.egg-info/PKG-INFO
+win_use.egg-info/SOURCES.txt
+win_use.egg-info/dependency_links.txt
+win_use.egg-info/entry_points.txt
+win_use.egg-info/requires.txt
+win_use.egg-info/top_level.txt

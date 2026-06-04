@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: win-use
+Version: 0.1.0
+Summary: Windows Computer Use CLI — 让 AI Agent 操控 Windows 桌面
+Author: TheMountainTree
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Operating System :: Microsoft :: Windows
+Requires-Python: >=3.10
+Requires-Dist: uiautomation>=2.0
+Requires-Dist: typer>=0.9
+Requires-Dist: Pillow>=9.0
+Requires-Dist: pyautogui
+Requires-Dist: pyperclip
+Provides-Extra: vision
+Requires-Dist: openai>=1.0; extra == "vision"
+Dynamic: author
+Dynamic: classifier
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
