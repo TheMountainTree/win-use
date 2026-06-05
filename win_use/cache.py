@@ -16,8 +16,8 @@ def get_cache_path() -> Path:
 def save_elements_cache(elements: list[dict]) -> Path:
     path = get_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    records = [
-        {
+    records = {
+        str(element["id"]): {
             "id": element["id"],
             "bounds": element["bounds"],
             "name": element.get("name", ""),
@@ -25,22 +25,26 @@ def save_elements_cache(elements: list[dict]) -> Path:
             "locator": element.get("_locator"),
         }
         for element in elements
-    ]
+    }
     temp_path = path.with_suffix(f".{os.getpid()}.tmp")
     temp_path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
     temp_path.replace(path)
     return path
 
 
-def load_elements_cache() -> list[dict]:
+def load_elements_cache() -> dict:
     path = get_cache_path()
     if not path.exists():
-        return []
+        return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        if isinstance(data, dict):
+            return {int(k): v for k, v in data.items()}
+        if isinstance(data, list):
+            return {r["id"]: r for r in data if "id" in r}
+        return {}
     except (OSError, json.JSONDecodeError):
-        return []
+        return {}
 
 
 def strip_internal_fields(data: dict) -> dict:

@@ -177,16 +177,16 @@ class CacheAndActionTests(unittest.TestCase):
                 ])
                 loaded = cache.load_elements_cache()
 
-        self.assertEqual(7, loaded[0]["id"])
-        self.assertEqual({"path": [0, 0]}, loaded[0]["locator"])
+        self.assertEqual(7, loaded[7]["id"])
+        self.assertEqual({"path": [0, 0]}, loaded[7]["locator"])
 
     def test_click_uses_resolved_current_bounds(self):
         _, _, button = make_tree()
-        cached = [{
+        cached = {7: {
             "id": 7,
             "bounds": {"x": 1, "y": 2, "w": 3, "h": 4},
             "locator": {"path": [0, 0]},
-        }]
+        }}
         with (
             patch.object(actions, "resolve_element", return_value=button),
             patch.object(actions.auto, "Click") as click,

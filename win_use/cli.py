@@ -2,17 +2,21 @@
 win-use CLI：AI Agent 操控 Windows 桌面的通用命令行工具。
 
 用法：
-    win-use read                # 读取当前无障碍树
-    win-use click --id 5        # 点击元素 5
-    win-use type "你好"          # 输入文字
-    win-use apps list           # 列出所有窗口
-    win-use batch flow.json     # 单进程执行多步工作流
-    win-use screenshot -o a.png # 截图
+    win-use serve                     # 启动长驻服务（复用 COM 上下文，加速连续调用）
+    win-use read                      # 读取当前无障碍树
+    win-use click --id 5              # 点击元素 5
+    win-use type "你好"               # 输入文字
+    win-use apps list                 # 列出所有窗口
+    win-use batch flow.json           # 单进程执行多步工作流
+    win-use screenshot -o a.png       # 截图
+
+所有命令在有 serve 运行时自动通过 socket 发送，避免重复进程启动开销。
 """
 
 import json
 import logging
 import sys
+from pathlib import Path
 from typing import Optional
 import typer
 
@@ -21,6 +25,35 @@ app = typer.Typer(
     help="Windows Computer Use CLI — 让 AI Agent 操控 Windows 桌面",
     add_completion=False,
 )
+
+_USE_SERVE = True
+
+
+def _try_serve(cmd: str, args: dict) -> bool:
+    if not _USE_SERVE:
+        return False
+    try:
+        from .serve import try_serve_call
+        result = try_serve_call(cmd, args)
+        if result is not None:
+            typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# ─── serve ───
+
+@app.command("serve")
+def cmd_serve(
+    port: int = typer.Option(0, "--port", "-p", help="监听端口，0=自动分配"),
+):
+    """启动长驻服务，复用 COM 上下文和 UIA 缓存，加速连续调用"""
+    from .serve import run_server
+
+    run_server(port)
+
 
 # ─── read ───
 
@@ -31,19 +64,32 @@ def cmd_read(
     depth: int = typer.Option(4, "--depth", "-d", help="递归深度上限"),
     interactive: bool = typer.Option(False, "--interactive", "-i", help="只输出可交互元素"),
     compact: bool = typer.Option(False, "--compact", "-c", help="精简输出"),
-    mode: str = typer.Option("full", "--mode", help="读取模式：full / compact"),
+    mode: str = typer.Option("auto", "--mode", help="windows / full / compact / auto（默认auto=无--window时windows，有时compact）"),
     all_windows: bool = typer.Option(False, "--all", help="包括后台和最小化窗口"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="保存到 JSON 文件"),
 ):
-    """读取当前 Windows 无障碍树，输出 JSON"""
-    from .reader import read_screen
-    from .cache import save_elements_cache, strip_internal_fields
-
-    if mode not in {"full", "compact"}:
-        typer.echo("错误：--mode 仅支持 full 或 compact", err=True)
+    """读取 Windows 无障碍树：无--window时只扫窗口层(L1)，--window后递归子树"""
+    _mode = mode
+    if _mode not in {"auto", "windows", "full", "compact"}:
+        typer.echo("错误：--mode 仅支持 auto / windows / full / compact", err=True)
         raise typer.Exit(1)
     if compact or interactive:
-        mode = "compact"
+        _mode = "compact"
+    if _mode == "auto":
+        _mode = "windows" if not window and not active else "compact"
+
+    args = {
+        "window": window,
+        "active": active,
+        "depth": depth,
+        "all": all_windows,
+        "mode": _mode,
+    }
+    if _try_serve("read", args):
+        return
+
+    from .reader import read_screen
+    from .cache import save_elements_cache, strip_internal_fields
 
     windows_list = [window] if window else None
 
@@ -52,7 +98,7 @@ def cmd_read(
         active_only=active,
         max_depth=depth,
         include_all=all_windows,
-        mode=mode,
+        mode=_mode,
     )
     save_elements_cache(data["elements"])
     strip_internal_fields(data)
@@ -78,6 +124,18 @@ def cmd_click(
     double: bool = typer.Option(False, "--double", help="双击"),
 ):
     """点击指定元素或坐标"""
+    args: dict = {}
+    if element_id:
+        args = {"element_id": int(element_id), "button": button, "double": double}
+    elif x is not None and y is not None:
+        args = {"x": int(x), "y": int(y), "button": button, "double": double}
+    else:
+        typer.echo("错误：请提供 --id 或 --x/--y", err=True)
+        raise typer.Exit(1)
+
+    if _try_serve("click", args):
+        return
+
     from .actions import click, double_click
     from .cache import load_elements_cache
 
@@ -117,8 +175,6 @@ def cmd_type(
     ),
 ):
     """输入字面量文字；默认移除 Agent/shell 意外传入的整段外层引号"""
-    from .actions import type_text
-
     if stdin:
         if text is not None:
             typer.echo("错误：使用 --stdin 时不要同时提供文字参数", err=True)
@@ -132,6 +188,16 @@ def cmd_type(
     if text is None:
         typer.echo("错误：请提供文字参数或使用 --stdin", err=True)
         raise typer.Exit(1)
+
+    args = {
+        "text": text,
+        "delay": delay,
+        "preserve_outer_quotes": preserve_outer_quotes,
+    }
+    if _try_serve("type", args):
+        return
+
+    from .actions import type_text
 
     result = type_text(
         text,
@@ -148,6 +214,10 @@ def cmd_keys(
     keys: str = typer.Argument(..., help="组合键，如 {Ctrl}c, {Win}r, {Alt}{F4}"),
 ):
     """发送键盘组合键"""
+    args = {"keys": keys}
+    if _try_serve("keys", args):
+        return
+
     from .actions import send_keys
 
     result = send_keys(keys)
@@ -164,6 +234,13 @@ def cmd_scroll(
     y: Optional[int] = typer.Option(None, "--y", help="滚动位置 Y"),
 ):
     """在指定位置滚动"""
+    args: dict = {"direction": direction, "amount": amount}
+    if x is not None and y is not None:
+        args["x"] = x
+        args["y"] = y
+    if _try_serve("scroll", args):
+        return
+
     from .actions import scroll
 
     coords = (x, y) if x is not None and y is not None else None
@@ -179,6 +256,10 @@ def cmd_move(
     y: int = typer.Argument(...),
 ):
     """移动鼠标到指定坐标（不点击）"""
+    args = {"x": x, "y": y}
+    if _try_serve("move", args):
+        return
+
     from .actions import move_mouse
 
     result = move_mouse((x, y))
@@ -195,6 +276,10 @@ def cmd_drag(
     to_y: int = typer.Argument(...),
 ):
     """从 (from_x, from_y) 拖拽到 (to_x, to_y)"""
+    args = {"from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y}
+    if _try_serve("drag", args):
+        return
+
     from .actions import drag
 
     result = drag((from_x, from_y), (to_x, to_y))
@@ -208,6 +293,10 @@ def cmd_wait(
     seconds: float = typer.Argument(1.0, help="等待秒数"),
 ):
     """等待指定秒数"""
+    args = {"seconds": seconds}
+    if _try_serve("wait", args):
+        return
+
     from .actions import wait
 
     result = wait(seconds)
@@ -223,17 +312,27 @@ def cmd_batch(
     ),
     json_data: Optional[str] = typer.Option(None, "--json", help="内联工作流 JSON"),
     pretty: bool = typer.Option(True, "--pretty/--no-pretty", help="格式化 JSON 输出"),
+    cleanup: bool = typer.Option(False, "--cleanup", help="执行后自动删除工作流 JSON 文件"),
 ):
     """单进程执行多步操作，每步返回 success、耗时和结果"""
-    from .batch import execute_batch, load_workflow
-
+    workflow_file = None
     try:
+        if json_data is not None or (workflow and workflow != "-"):
+            source = json_data or workflow
+            args = {"workflow": source}
+            if _try_serve("batch", args):
+                return
+
+        from .batch import execute_batch, load_workflow
+
         if json_data is not None:
             spec = load_workflow(json_data)
         elif workflow == "-":
             spec = json.loads(sys.stdin.read())
         elif workflow:
             spec = load_workflow(workflow)
+            if Path(workflow).exists():
+                workflow_file = Path(workflow)
         else:
             typer.echo("错误：请提供工作流 JSON 文件、JSON 字符串或 stdin", err=True)
             raise typer.Exit(1)
@@ -251,6 +350,12 @@ def cmd_batch(
             "error_type": type(exc).__name__,
         }, ensure_ascii=False), err=True)
         raise typer.Exit(1)
+    finally:
+        if cleanup and workflow_file:
+            try:
+                workflow_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ─── apps ───
@@ -263,6 +368,10 @@ def cmd_apps(
     timeout: float = typer.Option(2.0, "--timeout", "-t", help="等待窗口出现的秒数"),
 ):
     """管理应用窗口"""
+    args: dict = {"action": action, "name": name, "index": index, "timeout": timeout}
+    if _try_serve("apps", args):
+        return
+
     from . import apps as apps_mod
 
     try:
@@ -297,6 +406,10 @@ def cmd_screenshot(
     quality: int = typer.Option(85, "--quality", "-q", help="JPEG 质量 (1-100)"),
 ):
     """截取当前屏幕"""
+    args: dict = {"output": output, "base64": base64, "quality": quality}
+    if _try_serve("screenshot", args):
+        return
+
     from .screen import screenshot
 
     result = screenshot(output_file=output, to_base64=base64, quality=quality)

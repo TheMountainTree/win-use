@@ -7,25 +7,56 @@ description: Windows 桌面自动化工具 — 通过 UIA、selector、条件等
 
 通过 `uiautomation` 库读取 Windows UIA 无障碍树，实现窗口管理和元素操控。
 
+## 🔴 Agent 核心规则：必须优先使用 batch 模式
+
+**Agent 执行任何多步操作时，第一优先级永远是合并为 `batch` 工作流，一次性在单进程中完成。**
+
+> 原因：每个独立的 `win-use <cmd>` 调用都会启动一个全新 Python 进程（~500ms 启动开销）。
+> batch 将所有步骤在同一个进程中执行，消除重复进程启动和 UIA 树枚举开销。
+> 一个 5 步操作 (`read → click → type → keys → screenshot`)：
+> - 独立 CLI 模式：~3.0s（5 × 500ms 启动 + 各步骤耗时）
+> - batch 模式：~0.5s（1 × 启动 + 各步骤耗时）
+> - serve 模式 + batch：~0.15s（无启动开销 + 各步骤耗时）
+
+### 长驻服务（serve 模式）
+
+Agent 可在会话开始时启动 `win-use serve` 长驻服务，后续所有 CLI 命令自动通过 socket 复用服务进程的 COM 上下文和缓存：
+
+```bash
+# 启动服务（阻塞式，推荐在后台运行）
+win-use serve
+
+# 或指定端口
+win-use serve --port 9876
+
+# 客户端命令自动检测并连接 serve，无需额外配置
+win-use read --window "记事本" --mode compact
+win-use click --id 5
+```
+
+有 serve 运行时 CLI 命令延迟从 ~500ms 降到 ~5ms（纯 socket 通信），且窗口枚举缓存跨命令复用。
+
 ## 执行策略：默认走快速路径
 
 先判断任务属于哪种模式，不要机械地在每一步之间执行 `read`：
 
 | 场景 | 推荐方式 |
 |---|---|
-| 已知窗口、操作流程和目标元素名称 | 一次 `batch` 完成，优先使用 selector |
-| 已知窗口，但不清楚元素名称或结构 | 只执行一次目标窗口 `compact read`，然后用 `batch` |
-| 未知窗口名称 | 执行一次 `apps list`，确认后进入快速路径 |
+| 已知窗口、操作流程和目标元素名称 | **一次 `batch` 完成**，优先使用 selector |
+| 已知窗口，但不清楚元素名称或结构 | 一次目标窗口 `compact read`，然后**合并为 `batch`** |
+| 未知窗口名称 | 一次 `apps list`，确认后进入快速路径 |
+| 多步探索式交互 | 先 `win-use serve`，再逐条命令（每次 ~5ms 延迟） |
 | selector 找不到元素、界面结构未知 | 对目标窗口执行 `full read` 诊断 |
 | 需要确认业务结果 | 在 batch 末尾使用 `wait_for` 或 `screenshot` |
 
 ### 性能规则
 
-1. **已知流程必须优先使用 `batch`**，避免 Agent 与 CLI 多次往返。
+0. **多步操作必须合并为 `batch`**。Agent 的首要优化规则：任何 2 步及以上的操作流程，第一选择永远是写入 batch JSON 文件并执行 `win-use batch`。逐条 CLI 调用会产生 500ms/次的进程启动惩罚。
+1. **已知流程不可使用逐条 CLI**。必须优先使用 `batch`，避免 Agent 与 CLI 多次往返。
 2. **已知目标元素名称时直接使用 selector**，不要为了获取 ID 先执行 `read`。
 3. **只读取目标窗口**，不要默认读取全部桌面。
 4. **常规探索使用 `--mode compact`**；仅在 compact 信息不足时使用 `full`。
-5. **使用 `wait_for` 等待界面变化**，不要使用固定 `wait 1`、`wait 2`。
+5. **使用 `wait_for` 等待界面变化**（现在基于 UIA 事件通知，不再纯轮询），不要使用固定 `wait 1`、`wait 2`。
 6. **输入文字优先使用 `"delay": 0`**，通过剪贴板一次性粘贴。
 7. **优先使用 Name、AutomationId、ClassName 和控件类型定位**；坐标点击仅作最后降级。
 8. **不要在确定性操作之间重复 read**。只有界面结构未知或操作失败后才重新读取。
@@ -36,6 +67,9 @@ description: Windows 桌面自动化工具 — 通过 UIA、selector、条件等
 13. **普通文字只能使用 `type`，快捷键才使用 `keys`**。不要用 `keys` 输入搜索词或消息。
 14. `type` 默认使用字面量粘贴，并移除 Agent/shell 意外传入的整段外层引号。
 15. 复杂文本优先放入 batch JSON 文件或通过 `win-use type --stdin` 输入，避免 shell 多层转义。
+16. **需要多步探索时先启动 `win-use serve`**，后续逐条命令延迟从 ~500ms 降到 ~5ms。
+17. **batch JSON 文件使用 `--cleanup` 自动删除**，或写入 `%TEMP%/win-use/batch/` 目录避免项目内产生垃圾文件。
+18. **首次探索先用 `win-use read`（windows 模式）扫描窗口**，然后再 `win-use read --window "X"` 深入目标窗口，避免一次性深读全部窗口。
 
 ### 快速路径模板
 
@@ -84,16 +118,24 @@ win-use apps list
 ### 第二步：读取目标窗口的元素树
 
 ```bash
+# 先扫描所有窗口（windows 模式 = tree -L 1，极快）
+win-use read
+
+# 对目标窗口做 compact 读取（只输出可交互元素）
 win-use read --window "窗口名称" --mode compact
-# 或只读活动窗口
+
+# 深度诊断时用 full 模式
+win-use read --window "窗口名称" --mode full --depth 8
+
+# 只读活动窗口
 win-use read --active --mode compact
 ```
 
-读取模式由 Agent 按任务选择：
+读取模式由 Agent 按需选择：
 
-- `--mode full`：完整 UIA JSON 树，适合诊断、探索未知界面，默认模式
-- `--mode compact`：只输出目标窗口和可交互元素，适合常规操作
-- `--compact`：兼容旧调用，等价于 `--mode compact`
+- `--mode windows`（**无 --window 时的默认**）：只列出顶层窗口元数据（名、类、状态、坐标），不做深度遍历。等同于 `tree -L 1`，极快，适合确认窗口存在与否。
+- `--mode compact`（**有 --window 时的默认**）：只输出目标窗口和可交互元素，适合常规操作。
+- `--mode full`：完整 UIA JSON 树，适合诊断、探索未知界面。
 
 输出中每个元素包含：
 - `id` — 运行时分配的整数 ID（后续操作用此 ID 定位）
@@ -149,6 +191,9 @@ win-use screenshot -o result.png
 
 ```bash
 win-use batch examples/wechat-fast.json
+
+# 执行后自动删除临时 worklow 文件
+win-use batch /tmp/myflow.json --cleanup
 ```
 
 工作流支持 `apps.*`、`read`、`click`、`double_click`、`type`、`keys`、`scroll`、

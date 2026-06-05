@@ -13,33 +13,32 @@ def _center(bounds: dict) -> tuple:
     return (bounds["x"] + bounds["w"] // 2, bounds["y"] + bounds["h"] // 2)
 
 
-def _resolve_click_point(element_id: int, elements_cache: list) -> tuple[int, int]:
-    for cached in elements_cache:
-        if cached.get("id") != element_id:
-            continue
-        bounds = cached["bounds"]
-        locator = cached.get("locator")
-        element = resolve_element(locator)
-        if locator and element is None:
-            raise RuntimeError(f"元素 ID {element_id} 已失效，请重新 read")
-        if element is not None:
-            if safe_offscreen(element):
-                raise RuntimeError(f"元素 ID {element_id} 当前不在屏幕内，请滚动或恢复窗口")
-            x, y, width, height = safe_bounds(element)
-            bounds = {"x": x, "y": y, "w": width, "h": height}
-        if bounds["w"] <= 0 or bounds["h"] <= 0:
-            raise RuntimeError(f"元素 ID {element_id} 当前不可见，请重新 read 或先恢复窗口")
-        x, y = _center(bounds)
-        if abs(x) > 30000 or abs(y) > 30000:
-            raise RuntimeError(f"元素 ID {element_id} 当前位于屏幕外，请重新 read 或先恢复窗口")
-        return x, y
-    raise ValueError(f"元素 ID {element_id} 未在缓存中找到，请重新 read")
+def _resolve_click_point(element_id: int, elements_cache: dict) -> tuple[int, int]:
+    cached = elements_cache.get(element_id)
+    if cached is None:
+        raise ValueError(f"元素 ID {element_id} 未在缓存中找到，请重新 read")
+    bounds = cached["bounds"]
+    locator = cached.get("locator")
+    element = resolve_element(locator)
+    if locator and element is None:
+        raise RuntimeError(f"元素 ID {element_id} 已失效，请重新 read")
+    if element is not None:
+        if safe_offscreen(element):
+            raise RuntimeError(f"元素 ID {element_id} 当前不在屏幕内，请滚动或恢复窗口")
+        x, y, width, height = safe_bounds(element)
+        bounds = {"x": x, "y": y, "w": width, "h": height}
+    if bounds["w"] <= 0 or bounds["h"] <= 0:
+        raise RuntimeError(f"元素 ID {element_id} 当前不可见，请重新 read 或先恢复窗口")
+    x, y = _center(bounds)
+    if abs(x) > 30000 or abs(y) > 30000:
+        raise RuntimeError(f"元素 ID {element_id} 当前位于屏幕外，请重新 read 或先恢复窗口")
+    return x, y
 
 
 # ─── 点击 ───
 
 def click(coords: tuple[int, int] | None = None, element_id: int | None = None,
-          button: str = "left", elements_cache: list | None = None, settle: float = 0.3):
+          button: str = "left", elements_cache: dict | None = None, settle: float = 0.3):
     """
     点击指定坐标或元素。
 
@@ -47,7 +46,7 @@ def click(coords: tuple[int, int] | None = None, element_id: int | None = None,
         coords: 屏幕坐标 (x, y)
         element_id: 从 reader 返回的元素 ID
         button: left / right / middle
-        elements_cache: reader 返回的 elements 列表，用于按 ID 查找
+        elements_cache: reader 返回的 elements 索引字典，用于按 ID 查找
     """
     if element_id is not None and elements_cache:
         x, y = _resolve_click_point(element_id, elements_cache)
@@ -70,7 +69,7 @@ def click(coords: tuple[int, int] | None = None, element_id: int | None = None,
 
 
 def double_click(coords: tuple[int, int] | None = None, element_id: int | None = None,
-                 elements_cache: list | None = None, settle: float = 0.3):
+                 elements_cache: dict | None = None, settle: float = 0.3):
     """双击"""
     if element_id is not None and elements_cache:
         x, y = _resolve_click_point(element_id, elements_cache)

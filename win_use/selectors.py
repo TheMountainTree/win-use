@@ -1,7 +1,10 @@
 """直接查询 UIA 窗口和元素，供批处理与条件等待使用。"""
 
 import time
+import threading
 from collections import deque
+
+import uiautomation as auto
 
 from .utils import (
     get_active_window,
@@ -106,19 +109,102 @@ def find_elements(
     return matches
 
 
-def wait_for_element(
+class _EventNotAvailable(Exception):
+    pass
+
+
+def _wait_for_element_events(
     selector: dict,
-    window: str | None = None,
-    active: bool = True,
-    timeout: float = 5.0,
-    poll_interval: float = 0.1,
-    index: int = 0,
-    state: str = "present",
-    max_depth: int = 8,
+    window: str | None,
+    active: bool,
+    timeout: float,
+    poll_interval: float,
+    index: int,
+    state: str,
+    max_depth: int,
 ):
-    """等待元素出现或消失。出现时返回目标元素，消失时返回 None。"""
-    if state not in {"present", "absent"}:
-        raise ValueError("state 必须是 present 或 absent")
+    roots = _roots(window, active)
+    if not roots:
+        if state == "absent":
+            return None
+        raise ValueError("未找到目标窗口")
+
+    changed = threading.Event()
+    lock = threading.Lock()
+
+    def _on_structure_changed(*_args):
+        try:
+            changed.set()
+        except Exception:
+            pass
+
+    handlers = []
+    for root in roots:
+        try:
+            handler = auto.AddStructureChangedEventHandler(
+                root,
+                auto.TreeScope.TreeScope_Descendants,
+                _on_structure_changed,
+            )
+            handlers.append((root, handler))
+        except Exception:
+            pass
+        else:
+            try:
+                handler = auto.AddAutomationEventHandler(
+                    auto.EventId.Window_WindowOpenedEventId,
+                    root,
+                    auto.TreeScope.TreeScope_Descendants,
+                    _on_structure_changed,
+                )
+                handlers.append((root, handler))
+            except Exception:
+                pass
+
+    if not handlers:
+        raise _EventNotAvailable()
+
+    try:
+        deadline = time.monotonic() + max(0, timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            wait_interval = min(poll_interval, max(0.01, remaining))
+            changed.wait(timeout=wait_interval)
+            changed.clear()
+
+            matches = find_elements(selector=selector, window=window, active=active, max_depth=max_depth)
+            if state == "absent" and not matches:
+                return None
+            if state == "present" and len(matches) > index:
+                return matches[index]
+
+        if state == "absent":
+            raise TimeoutError(f"等待元素消失超时: {selector}")
+        raise TimeoutError(f"等待元素出现超时: {selector}，仅匹配到 {len(matches) if 'matches' in dir() else 0} 个")
+    finally:
+        for root, handler in handlers:
+            try:
+                auto.RemoveStructureChangedEventHandler(root, handler)
+            except Exception:
+                try:
+                    auto.RemoveAutomationEventHandler(root, handler)
+                except Exception:
+                    pass
+
+
+def _wait_for_element_polling(
+    selector: dict,
+    window: str | None,
+    active: bool,
+    timeout: float,
+    poll_interval: float,
+    index: int,
+    state: str,
+    max_depth: int,
+):
     deadline = time.monotonic() + max(0, timeout)
 
     while True:
@@ -137,3 +223,38 @@ def wait_for_element(
                 raise TimeoutError(f"等待元素消失超时: {selector}")
             raise TimeoutError(f"等待元素出现超时: {selector}，仅匹配到 {len(matches)} 个")
         time.sleep(max(0.01, poll_interval))
+
+
+def wait_for_element(
+    selector: dict,
+    window: str | None = None,
+    active: bool = True,
+    timeout: float = 5.0,
+    poll_interval: float = 0.1,
+    index: int = 0,
+    state: str = "present",
+    max_depth: int = 8,
+):
+    """等待元素出现或消失。出现时返回目标元素，消失时返回 None。
+
+    优先使用 UIA 结构变化事件订阅，失败时自动降级为轮询。
+    """
+    if state not in {"present", "absent"}:
+        raise ValueError("state 必须是 present 或 absent")
+
+    matches = find_elements(selector=selector, window=window, active=active, max_depth=max_depth)
+    if state == "absent" and not matches:
+        return None
+    if state == "present" and len(matches) > index:
+        return matches[index]
+
+    try:
+        return _wait_for_element_events(
+            selector, window, active, timeout, poll_interval, index, state, max_depth
+        )
+    except _EventNotAvailable:
+        pass
+
+    return _wait_for_element_polling(
+        selector, window, active, timeout, poll_interval, index, state, max_depth
+    )
