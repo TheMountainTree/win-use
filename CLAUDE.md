@@ -7,7 +7,14 @@ Python 包，通过 `uiautomation` 读取 Windows UIA 无障碍树，为 AI Agen
 **🔴 多步操作必须合并为 `batch` 工作流。** 逐条 CLI 命令会产生 ~500ms/次的进程启动惩罚。
 batch 将所有步骤在单进程中执行，消除重复进程启动和 UIA 树枚举开销。
 
-**探索式交互先启动 `win-use serve`**，后续逐条命令延迟降到 ~5ms（通过 socket 复用服务进程）。
+**🟡 CLI 调用用 `python -m win_use`，不要用 `win-use` 直接命令。**
+会话开始时先 `python -m win_use apps list` 确认可用；不可用时让用户 `pip install -e .`。
+不要用 `conda run` / 手动拼 `sys.argv` 绕过入口。
+
+**探索式交互先启动 `python -m win_use serve`**，后续逐条命令延迟降到 ~5ms（通过 socket 复用服务进程）。
+
+**🔴 截图降级时不可"估算"坐标。** opaque app 截完图必须把 base64 送给视觉模型提取精确坐标，
+禁止用窗口 bounds 推测。优先使用 `--overlay` 叠加编号坐标点，视觉模型返回最近点编号 + 偏移量，Agent 查表计算精确屏幕坐标。
 
 ## 项目结构
 

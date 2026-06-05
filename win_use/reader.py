@@ -16,6 +16,12 @@ from .utils import (
     safe_native_handle,
 )
 
+CHROME_BUTTON_NAMES = {"最小化", "最大化", "关闭", "置顶", "Minimize", "Maximize", "Close", "Restore"}
+MEANINGFUL_TYPES = {"Button", "Edit", "Document", "ListItem", "TreeItem", "MenuItem",
+                    "TabItem", "RadioButton", "CheckBox", "ComboBox", "SplitButton",
+                    "Hyperlink", "Text", "Image", "Slider", "Spinner"}
+WINDOW_TYPES = {"Window", "Pane", "ToolBar", "TitleBar"}
+
 
 def read_screen(
     windows: list[str] | None = None,
@@ -127,7 +133,7 @@ def read_screen(
     active_window = safe_name(active) if active is not None else ""
 
     mode_label = "compact" if compact else "full"
-    return {
+    result = {
         "success": True,
         "mode": mode_label,
         "screen_size": {"width": screen_w, "height": screen_h},
@@ -135,6 +141,57 @@ def read_screen(
         "element_count": len(elements),
         "elements": elements,
     }
+    result.update(_classify_opaque(elements))
+    return result
+
+
+def _classify_opaque(elements: list[dict]) -> dict:
+    interaction_count = 0
+    chrome_button_count = 0
+    container_count = 0
+    total_count = len(elements)
+
+    for el in elements:
+        el_type = el.get("type", "")
+        el_name = el.get("name", "")
+        has_patterns = bool(el.get("patterns"))
+
+        if el_type in WINDOW_TYPES:
+            continue
+
+        if has_patterns:
+            if el_name in CHROME_BUTTON_NAMES:
+                chrome_button_count += 1
+            elif el_type in MEANINGFUL_TYPES:
+                interaction_count += 1
+            else:
+                container_count += 1
+        elif el_type in MEANINGFUL_TYPES:
+            interaction_count += 1
+        else:
+            container_count += 1
+
+    opaque = interaction_count == 0 and total_count > 0
+
+    if opaque:
+        return {
+            "opaque_app": True,
+            "opaque_reason": (
+                f"共 {total_count} 个元素，其中 {chrome_button_count} 个窗口控件、"
+                f"{container_count} 个容器，无实际交互控件（Button/Edit/ListItem 等）"
+            ),
+        }
+
+    if interaction_count <= 2 and container_count >= 4:
+        return {
+            "opaque_app": False,
+            "opaque_warning": (
+                f"仅 {interaction_count} 个实际交互控件，{container_count} 个容器，"
+                "部分 UI 可能未暴露"
+            ),
+        }
+
+    return {"opaque_app": False}
 
 
 def _read_windows(active_only: bool, include_all: bool, filter_windows: list[str] | None) -> dict:

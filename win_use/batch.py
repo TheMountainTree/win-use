@@ -16,8 +16,89 @@ from .utils import safe_bounds, safe_offscreen
 SUPPORTED_ACTIONS = {
     "apps.list", "apps.focus", "apps.launch", "apps.close", "apps.minimize", "apps.maximize",
     "read", "click", "double_click", "type", "keys", "scroll", "move", "drag", "wait",
-    "wait_for", "screenshot",
+    "wait_for", "screenshot", "locate_vision",
 }
+
+VALID_FIELDS = {
+    "apps.launch":    {"name", "timeout", "action"},
+    "apps.focus":     {"name", "index", "timeout", "action"},
+    "apps.close":     {"name", "index", "action"},
+    "apps.minimize":  {"name", "index", "action"},
+    "apps.maximize":  {"name", "index", "action"},
+    "apps.list":      {"action"},
+    "read":           {"window", "active", "depth", "mode", "all", "action"},
+    "click":          {"selector", "id", "x", "y", "button", "double", "window", "active", "timeout", "poll_interval", "index", "depth", "settle", "action"},
+    "double_click":   {"selector", "id", "x", "y", "button", "window", "active", "timeout", "poll_interval", "index", "depth", "settle", "action"},
+    "type":           {"text", "delay", "settle", "preserve_outer_quotes", "action"},
+    "keys":           {"keys", "settle", "action"},
+    "scroll":         {"direction", "amount", "x", "y", "settle", "action"},
+    "move":           {"x", "y", "settle", "action"},
+    "drag":           {"from_x", "from_y", "to_x", "to_y", "settle", "action"},
+    "wait":           {"seconds", "action"},
+    "wait_for":       {"selector", "window", "active", "timeout", "poll_interval", "index", "state", "depth", "action"},
+    "screenshot":     {"output", "base64", "quality", "window", "overlay_grid", "action"},
+    "locate_vision":  {"window", "target", "model", "api_key", "base_url", "spacing", "action"},
+}
+
+TYPO_FIXES = {
+    "url": "name",
+    "duration": "seconds",
+    "sleep": "seconds",
+    "textToType": "text",
+    "message": "text",
+    "content": "text",
+    "input": "text",
+    "command": "keys",
+    "key": "keys",
+    "key_combination": "keys",
+    "shortcut": "keys",
+    "chrome": "window",
+    "browser": "window",
+    "app": "name",
+    "application": "name",
+    "title": "name",
+    "window_name": "name",
+    "windowName": "name",
+    "automationId": "selector",
+    "className": "selector",
+    "target_name": "name",
+}
+
+
+def _validate_step(step: dict, index: int):
+    action = step.get("action")
+    if not action:
+        raise ValueError(f"步骤 {index}: 缺少 action 字段")
+    if action not in SUPPORTED_ACTIONS:
+        raise ValueError(
+            f"步骤 {index}: 不支持的 action '{action}'，"
+            f"支持: {', '.join(sorted(SUPPORTED_ACTIONS))}"
+        )
+
+    if action in VALID_FIELDS:
+        for key in list(step.keys()):
+            if key in ("index",):
+                continue
+            if key not in VALID_FIELDS[action]:
+                fix = TYPO_FIXES.get(key)
+                if fix:
+                    raise ValueError(
+                        f"步骤 {index} ({action}): 无效字段 '{key}'，"
+                        f"你可能想用 '{fix}'"
+                    )
+                raise ValueError(
+                    f"步骤 {index} ({action}): 无效字段 '{key}'，"
+                    f"有效字段: {', '.join(sorted(VALID_FIELDS[action]))}"
+                )
+
+    if action == "type" and "text" not in step:
+        raise ValueError(f"步骤 {index} (type): 缺少 text 字段")
+    if action == "keys" and "keys" not in step:
+        raise ValueError(f"步骤 {index} (keys): 缺少 keys 字段")
+    if action in {"apps.launch", "apps.focus", "apps.close", "apps.minimize", "apps.maximize"} and "name" not in step:
+        raise ValueError(f"步骤 {index} ({action}): 缺少 name 字段")
+    if action == "wait" and "seconds" not in step:
+        raise ValueError(f"步骤 {index} (wait): 缺少 seconds 字段")
 
 
 def load_workflow(source: str) -> dict | list:
@@ -166,10 +247,25 @@ def run_step(step: dict, default_timeout: float = 5.0, default_settle: float = 0
             "element": element_summary(target) if target is not None else None,
         }
     if action == "screenshot":
+        overlay = step.get("overlay_grid")
+        if isinstance(overlay, bool) and not overlay:
+            overlay = False
         return screenshot(
             output_file=step.get("output"),
             to_base64=bool(step.get("base64", False)),
             quality=int(step.get("quality", 85)),
+            window_name=step.get("window"),
+            overlay_grid=overlay if overlay else False,
+        )
+    if action == "locate_vision":
+        from .vision import locate_element
+        return locate_element(
+            window_name=step["window"],
+            target_description=step["target"],
+            model=step.get("model", "gpt-4o"),
+            api_key=step.get("api_key"),
+            base_url=step.get("base_url"),
+            overlay_spacing=int(step.get("spacing", 150)),
         )
     raise AssertionError(f"未实现的 batch action: {action}")
 
@@ -183,6 +279,11 @@ def execute_batch(workflow: dict | list) -> dict:
     default_timeout = float(workflow.get("default_timeout", 5.0))
     default_settle = float(workflow.get("default_settle", 0.05))
     continue_on_error = bool(workflow.get("continue_on_error", False))
+
+    for index, step in enumerate(workflow["steps"]):
+        if isinstance(step, dict):
+            _validate_step(step, index)
+
     started = time.perf_counter()
     step_results = []
     success = True

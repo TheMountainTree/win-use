@@ -140,10 +140,26 @@ def _dispatch(cmd: str, args: dict) -> dict:
         return {"success": False, "error": f"未知操作: {action}"}
 
     if cmd == "screenshot":
+        overlay = args.get("overlay_grid")
+        if isinstance(overlay, bool) and not overlay:
+            overlay = False
         return screenshot(
             output_file=args.get("output"),
             to_base64=bool(args.get("base64", False)),
             quality=int(args.get("quality", 85)),
+            window_name=args.get("window"),
+            overlay_grid=overlay if overlay else False,
+        )
+
+    if cmd == "locate_vision":
+        from .vision import locate_element
+        return locate_element(
+            window_name=args["window"],
+            target_description=args["target"],
+            model=args.get("model", "gpt-4o"),
+            api_key=args.get("api_key"),
+            base_url=args.get("base_url"),
+            overlay_spacing=int(args.get("spacing", 150)),
         )
 
     return {"success": False, "error": f"未知命令: {cmd}"}

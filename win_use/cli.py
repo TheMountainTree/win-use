@@ -55,6 +55,35 @@ def cmd_serve(
     run_server(port)
 
 
+# ─── locate-vision ───
+
+@app.command("locate-vision")
+def cmd_locate_vision(
+    window: str = typer.Option(..., "--window", "-w", help="目标窗口名称"),
+    target: str = typer.Option(..., "--target", "-t", help="要定位的元素描述，如'页面底部的输入框'"),
+    model: str = typer.Option("gpt-4o", "--model", "-m", help="视觉模型名称"),
+    api_key: Optional[str] = typer.Option(None, "--api-key", help="API Key（默认用 OPENAI_API_KEY 环境变量）"),
+    base_url: Optional[str] = typer.Option(None, "--base-url", help="API Base URL"),
+    spacing: int = typer.Option(150, "--spacing", help="overlay 网格间距"),
+):
+    """截图+overlay → 视觉模型分析 → 返回精确屏幕坐标"""
+    from .vision import locate_element
+
+    try:
+        result = locate_element(
+            window_name=window,
+            target_description=target,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            overlay_spacing=spacing,
+        )
+        typer.echo(json.dumps(result, ensure_ascii=False))
+    except Exception as exc:
+        typer.echo(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False), err=True)
+        raise typer.Exit(1)
+
+
 # ─── read ───
 
 @app.command("read")
@@ -404,19 +433,32 @@ def cmd_screenshot(
     output: Optional[str] = typer.Option(None, "--output", "-o", help="保存路径"),
     base64: bool = typer.Option(False, "--base64", "-b", help="输出 base64"),
     quality: int = typer.Option(85, "--quality", "-q", help="JPEG 质量 (1-100)"),
+    window: Optional[str] = typer.Option(None, "--window", "-w", help="只截取指定窗口区域"),
+    overlay: bool = typer.Option(False, "--overlay", help="叠加编号坐标网格点（辅助视觉模型定位）"),
+    overlay_spacing: int = typer.Option(0, "--overlay-spacing", help="网格间距，默认 150px"),
 ):
-    """截取当前屏幕"""
+    """截取当前屏幕或指定窗口；--overlay 叠加编号坐标点"""
     args: dict = {"output": output, "base64": base64, "quality": quality}
+    if window:
+        args["window"] = window
+    overlay_val: bool | int = overlay_spacing if overlay_spacing > 0 else overlay
+    if overlay_val:
+        args["overlay_grid"] = overlay_val
     if _try_serve("screenshot", args):
         return
 
     from .screen import screenshot
 
-    result = screenshot(output_file=output, to_base64=base64, quality=quality)
+    result = screenshot(
+        output_file=output, to_base64=base64, quality=quality,
+        window_name=window, overlay_grid=overlay_val,
+    )
     if base64:
         b64_data = result.pop("base64")
         result["base64_length"] = len(b64_data)
         result["base64_preview"] = b64_data[:100] + "..."
+    if result.get("overlay_dots"):
+        result["overlay_dot_count"] = len(result["overlay_dots"])
 
     typer.echo(json.dumps(result, indent=2, ensure_ascii=False))
 

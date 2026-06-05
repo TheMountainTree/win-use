@@ -257,7 +257,7 @@ class BatchTests(unittest.TestCase):
         self.assertIn("elapsed_ms", result["steps"][0])
 
     def test_execute_batch_stops_on_error(self):
-        workflow = {"steps": [{"action": "keys"}, {"action": "wait"}]}
+        workflow = {"steps": [{"action": "keys", "keys": "{Enter}"}, {"action": "wait", "seconds": 0}]}
         with patch.object(batch, "run_step", side_effect=RuntimeError("failed")):
             result = batch.execute_batch(workflow)
         self.assertFalse(result["success"])

@@ -18,6 +18,24 @@ description: Windows 桌面自动化工具 — 通过 UIA、selector、条件等
 > - batch 模式：~0.5s（1 × 启动 + 各步骤耗时）
 > - serve 模式 + batch：~0.15s（无启动开销 + 各步骤耗时）
 
+### 🟡 Agent 使用 CLI 前必须先确认可用性
+
+**每次会话开始时，先测试 CLI 是否正常工作**。不要假设 `win-use` 命令存在。
+
+```bash
+# 使用 python -m 入口（始终可用，无需 pip install）
+python -m win_use apps list
+
+# 如果上面的命令失败（No module named win_use），告知用户执行：
+pip install -e .
+```
+
+**CLI 调用规范**：
+- 用 `python -m win_use` 代替 `win-use`（无需 PATH 配置，始终可用）
+- 批量操作用 `python -m win_use batch file.json`，**不要逐条调用**
+- 不要用 `conda run -n env python -c "from win_use.cli import ..."`（单次 1s+ 开销）
+- 不要手动拼 `sys.argv` 绕过 typer（参数规范容易出错）
+
 ### 长驻服务（serve 模式）
 
 Agent 可在会话开始时启动 `win-use serve` 长驻服务，后续所有 CLI 命令自动通过 socket 复用服务进程的 COM 上下文和缓存：
@@ -195,6 +213,136 @@ win-use batch examples/wechat-fast.json
 # 执行后自动删除临时 worklow 文件
 win-use batch /tmp/myflow.json --cleanup
 ```
+
+### 截图辅助定位（opaque app 降级策略）
+
+部分应用（Qt 自绘、Chrome Web App、Electron）不通过 UIA 暴露内部控件。
+`read` 的 compact/full 输出中会包含 `opaque_app: true` 标记，Agent 应自动降级为截图定位：
+
+```bash
+# 第一步：检测 opaque
+win-use read --window "LobeHub" --mode compact
+# → {"opaque_app": true, "opaque_reason": "共 11 个元素...无实际交互控件"}
+
+# 第二步：截图降级
+win-use screenshot --window "LobeHub" -o lobehub.png
+# 或 base64 用于视觉模型分析
+win-use screenshot --window "LobeHub" --base64 -b
+
+# 第三步：视觉模型分析截图获得元素坐标
+# (Agent 内部处理)
+
+# 第四步：坐标点击 + 输入
+win-use click --x 800 --y 1020
+win-use type "提问内容" --delay 0
+win-use keys "{Enter}"
+```
+
+batch 中对应写法：
+
+```json
+{
+  "steps": [
+    {"action": "read", "window": "LobeHub", "mode": "compact"},
+    {"action": "screenshot", "window": "LobeHub", "base64": true},
+    {"action": "click", "x": 800, "y": 1020},
+    {"action": "type", "text": "提问内容", "delay": 0},
+    {"action": "keys", "keys": "{Enter}"}
+  ]
+}
+```
+
+**Agent 截图降级决策树**：
+
+| `opaque_app` | `opaque_warning` | 策略 |
+|---|---|---|
+| `true` | — | **必须**截图 → **必须送给视觉模型**分析坐标 → 坐标点击 |
+| `false` | 有 `opaque_warning` | 可先用 UIA selector 点击；失败时截图检查 |
+| `false` | 无 | 直接用 UIA selector/id 定位 |
+
+**🔴 截图降级不可"估算"坐标。Agent 必须执行以下完整流程**：
+
+```
+1. 截图 → 2. 读取截图文件 → 3. 视觉模型分析 → 4. 提取精确坐标 → 5. 坐标点击
+```
+
+```bash
+# 步骤 1+2：截图并输出 base64
+python -m win_use screenshot --window "目标窗口" --base64
+
+# 步骤 3+4：Agent 将 base64 发送给视觉模型（GPT-4V / Claude Vision），
+# 提示词："图中输入框的屏幕绝对坐标（x, y）是多少？"
+
+# 步骤 5：使用视觉模型返回的精确坐标点击
+python -m win_use click --x <视觉模型返回的x> --y <视觉模型返回的y>
+```
+
+**禁止行为**：
+- ❌ 截图后不看图，用"窗口左上角 + 估算偏移"盲猜坐标
+- ❌ 用窗口 bounds 推算"大概中间是输入框"
+- ❌ 截了 base64 但不传给视觉模型分析
+
+**截图技巧**：
+- `--window "X"` 只截取目标窗口区域，减少无关信息和 token 消耗
+- `--base64` 返回 base64 编码，直接供视觉模型使用
+- `--overlay` 在截图上叠加编号坐标点网格，返回每个点的屏幕绝对坐标映射
+- batch 中截图后用 `click --x/--y` 坐标点击，不可用 selector（元素未暴露）
+
+### 编号坐标点叠加（`--overlay`）
+
+Opaque app 截图时可启用 `--overlay`，在窗口截图上叠加等间距编号红点：
+
+```bash
+python -m win_use screenshot --window "LobeHub" --overlay -o lobehub.png
+```
+
+**但 Agent 不应直接使用 `--overlay` + 手动分析**。应使用 `locate-vision` 命令，该命令内部完成截图→overlay→视觉模型→坐标的完整闭环：
+
+```bash
+# 一步到位：截图+overlay+视觉模型 → 直接返回屏幕坐标
+python -m win_use locate-vision --window "LobeHub" --target "页面底部的聊天输入框"
+
+# 返回：
+# {"success": true, "screen_x": 1580, "screen_y": 1098, "nearest_dot": 645, "offset": {"x": 35, "y": -12}}
+```
+
+**Agent 完整开源路径**：
+```bash
+python -m win_use apps focus "微信"
+python -m win_use read --window "微信" --mode compact
+# → {"opaque_app": true}  ← 检测到 opaque
+
+python -m win_use locate-vision --window "微信" --target "底部消息输入框"
+# → {"screen_x": 1200, "screen_y": 980}  ← 直接可用的屏幕坐标
+
+python -m win_use click --x 1200 --y 980
+python -m win_use type "消息" --delay 0
+python -m win_use keys "{Enter}"
+```
+
+**batch 中对应写法**：
+
+```json
+{
+  "steps": [
+    {"action": "read", "window": "微信", "mode": "compact"},
+    {"action": "locate_vision", "window": "微信", "target": "底部消息输入框"},
+    {"action": "click", "x": "$locate_vision.screen_x", "y": "$locate_vision.screen_y"},
+    {"action": "type", "text": "消息", "delay": 0},
+    {"action": "keys", "keys": "{Enter}"}
+  ]
+}
+```
+
+**`locate-vision` 参数**：
+- `--window` / `-w`：目标窗口名称
+- `--target` / `-t`：要定位的元素自然语言描述
+- `--model`：视觉模型，默认 `gpt-4o`
+- `--api-key`：API Key（默认用 `OPENAI_API_KEY` 环境变量）
+- `--base-url`：自定义 API 端点
+- `--spacing`：overlay 网格间距，默认 150px
+
+**返回字段**：`screen_x`, `screen_y`（可直接用于 `click --x/--y`）、`nearest_dot`, `offset`
 
 工作流支持 `apps.*`、`read`、`click`、`double_click`、`type`、`keys`、`scroll`、
 `move`、`drag`、`wait`、`wait_for`、`screenshot`。每一步返回：
