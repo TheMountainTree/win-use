@@ -70,7 +70,6 @@ def _dispatch(cmd: str, args: dict) -> dict:
             if args.get("double"):
                 return double_click(
                     element_id=element_id, elements_cache=elements_cache,
-                    button=args.get("button", "left"),
                 )
             return click(
                 element_id=element_id, elements_cache=elements_cache,

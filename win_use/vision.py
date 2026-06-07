@@ -1,7 +1,6 @@
 """视觉模型定位：截图 + overlay → 视觉 API → 屏幕坐标。"""
 
 import base64
-import io
 import json
 import logging
 import os
@@ -19,12 +18,6 @@ offset_x: horizontal pixels from that dot's center to the target center (positiv
 offset_y: vertical pixels from that dot's center to the target center (positive=down, negative=up).
 
 TARGET: {target}"""
-
-
-def _image_to_base64(image) -> str:
-    buf = io.BytesIO()
-    image.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
 
 
 def _call_vision_api(
@@ -98,9 +91,10 @@ def locate_element(
         raise RuntimeError("需要 OPENAI_API_KEY 环境变量或 --api-key 参数")
     base_url = base_url or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
+    # 单次截图：获取 overlay 图片（base64）和 dots 坐标，避免双重 grab 导致的坐标漂移
     shot = screenshot(
         window_name=window_name,
-        to_base64=False,
+        to_base64=True,
         quality=quality,
         overlay_grid=overlay_spacing,
     )
@@ -109,29 +103,10 @@ def locate_element(
     if not dots:
         raise RuntimeError("overlay 生成失败，窗口可能不存在或太小")
 
-    from PIL import ImageGrab
+    image_b64 = shot.get("base64", "")
+    if not image_b64:
+        raise RuntimeError("截图 base64 编码失败")
 
-    from .utils import (
-        get_top_level_windows,
-        is_meaningful_window,
-        safe_bounds,
-        window_matches,
-    )
-
-    img = ImageGrab.grab()
-    offset_x, offset_y = 0, 0
-    windows = [w for w in get_top_level_windows() if is_meaningful_window(w)]
-    matched = [w for w in windows if window_matches(w, window_name)[0]]
-    if matched:
-        x, y, w, h = safe_bounds(matched[0])
-        if w > 0 and h > 0:
-            offset_x, offset_y = x, y
-            img = img.crop((x, y, x + w, y + h))
-
-    from .screen import _apply_overlay
-    overlay_img, _dots_check = _apply_overlay(img, offset_x, offset_y, overlay_spacing)
-
-    image_b64 = _image_to_base64(overlay_img)
     vision_result = _call_vision_api(
         image_b64, target_description, model, api_key, base_url
     )
