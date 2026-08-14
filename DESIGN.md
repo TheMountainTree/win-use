@@ -17,17 +17,18 @@ AI Agent 需要一个标准化的接口来观察和操控图形用户界面。�
 
 | 能力 | 命令 | 说明 |
 |------|------|------|
-| 观察 | `win-use read` | 读取 UIA 无障碍树，输出结构化 JSON |
-| 操作 | `win-use click / type / keys / scroll / drag` | 模拟鼠标键盘操作 |
-| 窗口 | `win-use apps list / focus / launch / close` | 窗口与应用生命周期管理 |
-| 截图 | `win-use screenshot` | 截取当前屏幕 |
-| 批处理 | `win-use batch workflow.json` | 单进程执行多步工作流，支持 `wait_for` 条件等待 |
-| 系统 | `win-use shell` | 执行 PowerShell 命令，获取标准输出 |
+| 观察 | `read` | 读取 UIA 无障碍树，输出结构化 JSON |
+| 操作 | `click / type / keys / scroll / drag` | 模拟鼠标键盘操作 |
+| 窗口 | `apps list / focus / launch / close` | 窗口与应用生命周期管理 |
+| 截图 | `screenshot` | 截取当前屏幕 |
+| 条件等待 | `wait_for` | 基于 UIA 事件的条件等待，自动降级轮询 |
+| 视觉定位 | `locate_vision` | 截图 + overlay → 视觉模型 → 精确坐标 |
+| 系统 | `shell` | 执行 PowerShell 命令，获取标准输出 |
 
 ### 1.3 设计原则
 
 - **AI-First**: 所有输出均为结构化 JSON，无人类可读格式
-- **无状态 CLI**: 每个命令独立进程运行；元素定位信息通过临时文件跨进程持久化
+- **Loop Agent 常驻进程**: 单进程复用 COM 上下文，通过 stdin/stdout JSON-lines 逐条交互，消除进程启动开销
 - **渐进增强**: 从坐标点击 → ID 点击 → 语义选择器，三种定位策略逐级提升鲁棒性
 - **容错优先**: 所有 UIA 属性读取包裹 `try/except`，失败返回默认值而非崩溃
 
@@ -39,20 +40,24 @@ AI Agent 需要一个标准化的接口来观察和操控图形用户界面。�
 
 ```mermaid
 graph TB
-    subgraph "CLI 层"
-        CLI[cli.py<br/>Typer 命令入口]
+    subgraph "REPL 层"
+        CLI[cli.py<br/>stdin/stdout JSON-lines REPL]
+    end
+
+    subgraph "分发层"
+        DISPATCH[dispatch.py<br/>命令分发 + LoopContext]
     end
 
     subgraph "业务逻辑层"
         READER[reader.py<br/>UIA 树读取]
         ACTIONS[actions.py<br/>输入操作]
         APPS[apps.py<br/>窗口管理]
-        BATCH[batch.py<br/>工作流引擎]
         SCREEN[screen.py<br/>截图]
+        VISION[vision.py<br/>视觉定位]
     end
 
     subgraph "定位与缓存层"
-        CACHE[cache.py<br/>跨进程缓存]
+        CACHE[cache.py<br/>内存缓存 + 文件兼容]
         LOCATOR[locator.py<br/>元素重定位]
         SELECTORS[selectors.py<br/>选择器匹配]
     end
@@ -63,21 +68,18 @@ graph TB
         PYTHON[pyautogui / pyperclip<br/>辅助输入]
     end
 
-    CLI --> READER
-    CLI --> ACTIONS
-    CLI --> APPS
-    CLI --> BATCH
-    CLI --> SCREEN
+    CLI --> DISPATCH
+    DISPATCH --> READER
+    DISPATCH --> ACTIONS
+    DISPATCH --> APPS
+    DISPATCH --> SCREEN
+    DISPATCH --> VISION
+    DISPATCH --> SELECTORS
 
     READER --> UTILS
     READER --> LOCATOR
     ACTIONS --> LOCATOR
     ACTIONS --> CACHE
-    BATCH --> READER
-    BATCH --> ACTIONS
-    BATCH --> APPS
-    BATCH --> SCREEN
-    BATCH --> SELECTORS
     APPS --> UTILS
     SELECTORS --> UTILS
     LOCATOR --> UTILS
@@ -92,14 +94,15 @@ graph TB
 
 | 模块 | 职责 | 依赖 |
 |------|------|------|
-| `cli.py` | CLI 入口，参数解析，命令分发 | 所有业务模块 |
-| `reader.py` | 递归遍历 UIA 树，输出 full/compact 两种 JSON | `utils`, `locator` |
+| `cli.py` | stdin/stdout JSON-lines REPL 主循环，预热 COM 上下文 | `dispatch` |
+| `dispatch.py` | 命令分发核心，`dispatch(cmd, args, ctx)` 路由到各 handler，`LoopContext` 持有内存缓存 | 所有业务模块 |
+| `reader.py` | 递归遍历 UIA 树，输出 full/compact/windows 三种 JSON | `utils`, `locator` |
 | `actions.py` | 点击、输入、按键、滚动、拖拽、等待 | `locator`, `cache`, `uiautomation`, `pyautogui` |
 | `apps.py` | 窗口列举、聚焦、启动、关闭、最小化/最大化 | `utils`, `uiautomation` |
-| `batch.py` | 工作流 JSON 解析，多步骤顺序执行 | `reader`, `actions`, `apps`, `selectors`, `screen` |
 | `screen.py` | 全屏截图，支持文件保存和 base64 输出 | `PIL.ImageGrab` |
-| `cache.py` | 元素信息的临时文件持久化（跨 CLI 进程） | 文件系统 |
-| `locator.py` | 根据持久化的 locator 在最新 UIA 树中重新定位元素 | `utils` |
+| `vision.py` | 截图 + overlay → 视觉模型 → 精确坐标 | `screen`, `openai` |
+| `cache.py` | 内存缓存构建 + 文件持久化（崩溃恢复/外部检查） | 文件系统 |
+| `locator.py` | 根据缓存 locator 在最新 UIA 树中重新定位元素 | `utils` |
 | `selectors.py` | 按 name/type/automation_id 等多字段查询元素，支持等待 | `utils` |
 | `utils.py` | 安全属性读取、窗口过滤、元素判断、屏幕信息 | `uiautomation` |
 
@@ -191,31 +194,32 @@ graph TB
 3. `name` 相同 + 可选 `class_name` 相同
 4. 仅 `class_name` 相同
 
-### 3.3 跨进程缓存 (`cache.py`)
+### 3.3 元素缓存 (`cache.py`)
 
 #### 3.3.1 设计目标
 
-CLI 每次调用是独立进程，无法在内存中保持状态。需要一种轻量机制使 `read` 和 `click --id N` 跨进程共享元素信息。
+常驻进程模式下，`read` 和 `click --id N` 在同一进程内执行，可直接共享内存缓存。
+同时保留文件持久化以支持崩溃恢复和外部检查。
 
 #### 3.3.2 实现方案
 
-- **存储位置**: `%TEMP%/win-use/last-read.json`，可通过 `WIN_USE_CACHE_PATH` 环境变量覆盖
-- **写入**: `read` 命令完成后写入精简的元素记录（id, bounds, name, type, locator）
-- **读取**: `click --id N` 时加载缓存，按 ID 查找 locator，重新解析为当前 UIA 元素
+- **内存缓存**: `LoopContext.element_cache` 字典，`read` 填充，`click --id` 直接 O(1) 查找
+- **文件兼容**: `save_elements_cache` 同步写入 `%TEMP%/win-use/last-read.json`（`WIN_USE_CACHE_PATH` 可覆盖）
 - **原子写入**: 先写临时文件，再 `replace`，避免并发读写脏数据
+- **构建内存缓存**: `build_memory_cache(elements)` 从 read_screen 输出构建 `{id: record}` 字典
 
 #### 3.3.3 缓存记录结构
 
 ```json
-[
-  {
+{
+  "42": {
     "id": 42,
     "bounds": {"x": 100, "y": 200, "w": 80, "h": 30},
     "name": "确定",
     "type": "Button",
     "locator": { /* 完整 locator */ }
   }
-]
+}
 ```
 
 ### 3.4 动作模块 (`actions.py`)
@@ -282,57 +286,50 @@ Name > AutomationId > ClassName
 3. 轮询等待窗口出现（默认超时 2s）
 ```
 
-### 3.6 批处理引擎 (`batch.py`)
+### 3.6 命令分发 (`dispatch.py`)
 
 #### 3.6.1 设计动机
 
-独立 CLI 命令模式下，每次 `read` → `click` 需要两个进程，开销大且无法做条件等待。batch 模式在单进程中顺序执行多步操作，每步返回 `success`、`elapsed_ms` 和结构化结果。
+loop agent 常驻进程模式下，agent 逐条发送命令、逐条获取结果、根据结果决定下一步。
+`dispatch(cmd, args, ctx)` 是单一分发入口，路由到各 handler 函数，`LoopContext` 持有跨命令的内存状态。
 
-#### 3.6.2 支持的操作
+#### 3.6.2 支持的命令
 
 ```
-apps.list / apps.focus / apps.launch / apps.close / apps.minimize / apps.maximize
-read / click / double_click / type / keys / scroll / move / drag
-wait / wait_for / screenshot
+read / click / type / keys / scroll / move / drag / wait / wait_for
+apps / screenshot / locate_vision / shell
 ```
 
-#### 3.6.3 工作流结构
+#### 3.6.3 REPL 协议
 
+请求（每行一个 JSON）：
 ```json
-{
-  "default_timeout": 5.0,
-  "default_settle": 0.05,
-  "continue_on_error": false,
-  "steps": [
-    {
-      "action": "read",
-      "window": "Weixin",
-      "active": true,
-      "mode": "compact"
-    },
-    {
-      "action": "click",
-      "selector": {
-        "name": "发送",
-        "match": "contains"
-      },
-      "timeout": 5
-    }
-  ]
-}
+{"cmd": "read", "args": {"window": "记事本", "mode": "compact"}}
+```
+
+响应（每行一个 JSON）：
+```json
+{"success": true, "mode": "compact", "elements": [...]}
+```
+
+错误：
+```json
+{"success": false, "error": "...", "error_type": "ValueError"}
 ```
 
 #### 3.6.4 `wait_for` 条件等待
 
 ```json
 {
-  "action": "wait_for",
-  "selector": {"name": "就绪", "visible": true},
-  "state": "present",
-  "timeout": 10,
-  "poll_interval": 0.1,
-  "index": 0,
-  "depth": 8
+  "cmd": "wait_for",
+  "args": {
+    "selector": {"name": "就绪", "visible": true},
+    "state": "present",
+    "timeout": 10,
+    "poll_interval": 0.1,
+    "index": 0,
+    "depth": 8
+  }
 }
 ```
 
@@ -348,8 +345,8 @@ wait / wait_for / screenshot
 
 #### 3.6.5 错误处理
 
-- `continue_on_error: false`（默认）: 任一步骤失败立即终止，返回 `success: false` 和失败步骤信息
-- `continue_on_error: true`: 失败步骤记录错误后继续执行剩余步骤，最终 `success` 取决于是否所有步骤成功
+所有异常在 `dispatch` 层统一捕获，返回 `{"success": false, "error": ..., "error_type": ...}`，
+不会导致进程崩溃。agent 可根据 `error_type` 决定重试或调整策略。
 
 ### 3.7 选择器系统 (`selectors.py`)
 
@@ -390,130 +387,101 @@ wait / wait_for / screenshot
 
 ## 4. 数据流
 
-### 4.1 独立命令模式
+### 4.1 Loop Agent REPL 模式
 
 ```mermaid
 sequenceDiagram
     participant AI as AI Agent
-    participant CLI as win-use CLI
+    participant REPL as cli.py REPL
+    participant D as dispatch.py
     participant R as reader.py
     participant C as cache.py
     participant A as actions.py
     participant L as locator.py
     participant UIA as UIA 树
 
-    Note over AI,UIA: Step 1: 观察
-    AI->>CLI: win-use read --mode compact
-    CLI->>R: read_screen()
+    Note over AI,UIA: 进程启动：预热 COM 上下文
+    AI->>REPL: stdin: {"cmd":"read","args":{"mode":"compact"}}
+    REPL->>D: dispatch("read", args, ctx)
+    D->>R: read_screen()
     R->>UIA: 递归遍历
     UIA-->>R: 元素属性
-    R->>C: save_elements_cache()
-    C-->>CLI: 临时文件
-    R-->>CLI: JSON (含元素列表)
-    CLI-->>AI: {"screen_size", "elements": [...]}
+    R->>C: build_memory_cache() + save_elements_cache()
+    C-->>D: ctx.element_cache 填充
+    D-->>REPL: {"success":true, "elements":[...]}
+    REPL-->>AI: stdout: JSON 一行
 
-    Note over AI,UIA: Step 2: 决策与操作
-    AI->>CLI: win-use click --id 42
-    CLI->>A: click(element_id=42)
-    A->>C: load_elements_cache()
-    C-->>A: [{id:42, locator:{...}}, ...]
+    AI->>REPL: stdin: {"cmd":"click","args":{"id":42}}
+    REPL->>D: dispatch("click", args, ctx)
+    D->>A: click(element_id=42, elements_cache=ctx.element_cache)
     A->>L: resolve_element(locator)
     L->>UIA: 搜索当前 UIA 树
     UIA-->>L: 匹配元素
     L-->>A: 元素引用
     A->>UIA: Click(x, y)
-    A-->>CLI: {"success": true, ...}
-    CLI-->>AI: JSON 结果
-```
+    A-->>D: {"success": true, ...}
+    D-->>REPL: 结果
+    REPL-->>AI: stdout: JSON 一行
 
-### 4.2 批处理模式
-
-```mermaid
-sequenceDiagram
-    participant AI as AI Agent
-    participant CLI as win-use CLI
-    participant B as batch.py
-    participant M as 各业务模块
-
-    AI->>CLI: win-use batch workflow.json
-    CLI->>B: execute_batch(workflow)
-
-    loop 每个步骤
-        B->>B: run_step(step)
-        alt read
-            B->>M: read_screen()
-        else click
-            B->>M: click / _click_element
-        else wait_for
-            B->>M: wait_for_element()
-        else apps.*
-            B->>M: apps 模块方法
-        end
-        M-->>B: 结果
-        B->>B: 记录步骤结果和耗时
-    end
-
-    B-->>CLI: {success, steps, total_elapsed_ms}
-    CLI-->>AI: JSON 结果
+    Note over AI,UIA: stdin 关闭 → 进程优雅退出
 ```
 
 ---
 
-## 5. CLI 接口设计
+## 5. REPL 接口设计
 
 ### 5.1 命令总览
 
 ```
-win-use
+python -m win_use    # 启动 loop agent REPL
+
+请求格式（每行一个 JSON）:
+{"cmd": "...", "args": {...}}
+
+命令集:
 ├── read        # 读取 UIA 无障碍树
-│     --window, -w    指定窗口
-│     --active, -a    仅活动窗口
-│     --depth, -d     递归深度 (default: 4)
-│     --mode          full|compact (default: full)
-│     --all           包含后台/最小化窗口
-│     --output, -o    保存到 JSON 文件
+│     window, active, depth, mode, all
 │
 ├── click       # 点击元素或坐标
-│     --id            元素 ID（需先 read）
-│     --x, --y        屏幕坐标
-│     --button, -b    left|right|middle (default: left)
-│     --double        双击
+│     id 或 x/y, button, double
 │
 ├── type        # 输入文字
-│     --delay, -d     每字延迟毫秒 (0=粘贴模式)
-│     --stdin         从 stdin 读取
+│     text, delay, preserve_outer_quotes
 │
 ├── keys        # 发送组合键
+│     keys
 │
 ├── scroll      # 滚动
-│     --amount, -a    滚动像素量
-│     --x, --y        滚动位置
+│     direction, amount, x, y
 │
 ├── move        # 移动鼠标
+│     x, y
 │
 ├── drag        # 拖拽
+│     from_x, from_y, to_x, to_y
 │
 ├── wait        # 等待秒数
+│     seconds
 │
-├── batch       # 执行工作流
-│     --json          内联 JSON
+├── wait_for    # 条件等待
+│     selector, window, active, timeout, state
 │
 ├── apps        # 窗口管理
-│     list|focus|launch|close|minimize|maximize
-│     --index, -n     多匹配选择
-│     --timeout, -t   超时秒数
+│     action(list/focus/launch/close/minimize/maximize), name, index, timeout
 │
 ├── screenshot  # 截图
-│     --output, -o    保存路径
-│     --base64, -b    base64 编码
-│     --quality, -q   JPEG 质量
+│     output, base64, quality, window, overlay_grid
+│
+├── locate_vision  # 视觉定位
+│     window, target, model, spacing
 │
 └── shell       # 执行 PowerShell
+      command, timeout
 ```
 
 ### 5.2 输出规范
 
-所有命令输出均为 JSON，统一格式:
+所有响应均为 JSON，每行一个，统一格式:
 
 ```json
 {
@@ -523,7 +491,15 @@ win-use
 }
 ```
 
-错误输出也保持 JSON 格式，通过 stderr 输出，exit code 非零。
+错误也通过同一 JSON 流返回（非 stderr）:
+
+```json
+{
+  "success": false,
+  "error": "...",
+  "error_type": "ValueError"
+}
+```
 
 ---
 
@@ -540,15 +516,16 @@ win-use
 
 **选型理由**: `uiautomation` 提供了最简洁的 Python 封装，社区活跃，能满足读取 + 操作的核心需求。
 
-### 6.2 跨进程状态管理：缓存文件 vs IPC
+### 6.2 常驻进程 vs 无状态 CLI
 
 | 方案 | 优势 | 劣势 |
 |------|------|------|
-| **临时文件缓存** ✅ | 实现简单，无后台进程，天然持久化 | 有磁盘 I/O 开销（可忽略） |
-| 本地 Socket IPC | 实时性强 | 需要常驻后台进程，复杂度高 |
-| 内存映射文件 | 性能好 | Windows 特化，可移植性差 |
+| **Loop Agent 常驻进程** ✅ | 复用 COM 上下文，消除 ~500ms/次启动开销；内存缓存 O(1) 查找 | 需管理进程生命周期 |
+| 无状态 CLI（每次新进程） | 实现简单，无状态 | 每次启动重复初始化 UIA，延迟高 |
+| 本地 Socket IPC | 支持多客户端 | 协议复杂，需端口发现 |
 
-**选型理由**: AI Agent 调用频率低（秒级），临时文件的延迟可忽略。无需常驻后台进程，更符合"无状态工具"的设计理念。
+**选型理由**: loop agent 常驻进程通过 stdin/stdout JSON-lines 逐条交互，单进程复用 COM 上下文，
+消除进程启动惩罚。内存缓存为主、文件为辅（崩溃恢复/外部检查），兼顾性能与可靠性。
 
 ### 6.3 三级定位策略
 
@@ -556,7 +533,7 @@ win-use
 |------|---------|------|------|
 | 1 | 屏幕坐标 `--x --y` | 无依赖，100% 可靠 | 分辨率/DPI 敏感，不支持窗口移动 |
 | 2 | 缓存 ID `--id N` | 相对鲁棒 | 需先 read，跨进程缓存 |  
-| 3 | 语义选择器 `selector` | 最鲁棒，语义化 | 仅 batch 模式支持，可能有歧义 |
+| 3 | 语义选择器 `selector` | 最鲁棒，语义化 | 通过 `wait_for` 命令支持，可能有歧义 |
 
 **选型理由**: 渐进增强设计。坐标点击作为保底方案；ID 定位满足大部分场景；语义选择器为复杂工作流提供最佳鲁棒性。
 
@@ -576,7 +553,6 @@ compact 模式不简单丢弃非交互元素，而是**跳过显示但递归搜�
 | 包 | 版本 | 用途 |
 |----|------|------|
 | `uiautomation` | ≥2.0 | Windows UIA 客户端核心 |
-| `typer` | ≥0.9 | CLI 框架 |
 | `Pillow` | ≥9.0 | 截图处理 |
 | `pyautogui` | * | 辅助鼠标操作 |
 | `pyperclip` | * | 剪贴板粘贴 |
@@ -595,7 +571,7 @@ compact 模式不简单丢弃非交互元素，而是**跳过显示但递归搜�
 
 - **Vision 支持**: `setup.py` 中 `[vision]` extra 已预留，可接入 GPT-4V 等多模态模型分析截图
 - **自定义选择器匹配**: `selectors.py` 的 `element_matches` 可扩展新的匹配字段和模式
-- **批处理自定义动作**: `SUPPORTED_ACTIONS` 集合可扩展新 action 类型
+- **新增命令**: 在 `dispatch.py` 的 `_COMMANDS` 注册表中添加 handler 函数即可
 - **缓存策略可替换**: `WIN_USE_CACHE_PATH` 环境变量允许自定义缓存位置
 
 ### 8.2 已知限制

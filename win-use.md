@@ -1,58 +1,79 @@
 ---
 name: win-use
-description: Windows 桌面自动化工具 — 通过 UIA、selector、条件等待和 batch 快速操控 Windows
+description: Windows 桌面自动化工具 — 通过 UIA、selector、条件等待和 loop agent 常驻进程操控 Windows
 ---
 
 # win-use — Windows Computer Use for AI Agents
 
 通过 `uiautomation` 库读取 Windows UIA 无障碍树，实现窗口管理和元素操控。
 
-## 🔴 Agent 核心规则：必须优先使用 batch 模式
+## 🔴 Agent 核心规则：使用 loop agent 常驻进程
 
-**Agent 执行任何多步操作时，第一优先级永远是合并为 `batch` 工作流，一次性在单进程中完成。**
+**核心理念是 loop agent 常驻进程。** `python -m win_use` 启动后进入 stdin/stdout
+JSON-lines REPL：agent 逐行发送 `{"cmd": "...", "args": {...}}`，进程逐行返回
+`{"success": true/false, ...}`。单进程复用 COM 上下文，消除 ~500ms/次的进程启动惩罚。
 
-> 原因：每个独立的 `win-use <cmd>` 调用都会启动一个全新 Python 进程（~500ms 启动开销）。
-> batch 将所有步骤在同一个进程中执行，消除重复进程启动和 UIA 树枚举开销。
 > 一个 5 步操作 (`read → click → type → keys → screenshot`)：
-> - 独立 CLI 模式：~3.0s（5 × 500ms 启动 + 各步骤耗时）
-> - batch 模式：~0.5s（1 × 启动 + 各步骤耗时）
-> - serve 模式 + batch：~0.15s（无启动开销 + 各步骤耗时）
+> - 逐条独立 CLI（旧模式）：~3.0s（5 × 500ms 启动 + 各步骤耗时）
+> - loop agent REPL：~0.15s（1 × 启动 + 各步骤耗时，无重复启动开销）
 
-### 🟡 Agent 使用 CLI 前必须先确认可用性
+### 🟡 会话开始时先启动常驻进程
 
-**每次会话开始时，先测试 CLI 是否正常工作**。不要假设 `win-use` 命令存在。
-
-```bash
-# 使用 python -m 入口（始终可用，无需 pip install）
-python -m win_use apps list
-
-# 如果上面的命令失败（No module named win_use），告知用户执行：
-pip install -e .
-```
-
-**CLI 调用规范**：
-- 用 `python -m win_use` 代替 `win-use`（无需 PATH 配置，始终可用）
-- 批量操作用 `python -m win_use batch file.json`，**不要逐条调用**
-- 不要用 `conda run -n env python -c "from win_use.cli import ..."`（单次 1s+ 开销）
-- 不要手动拼 `sys.argv` 绕过 typer（参数规范容易出错）
-
-### 长驻服务（serve 模式）
-
-Agent 可在会话开始时启动 `win-use serve` 长驻服务，后续所有 CLI 命令自动通过 socket 复用服务进程的 COM 上下文和缓存：
+**每次会话开始时，先 `python -m win_use` 启动常驻进程**，通过 stdin/stdout 逐条交互。
+不可用时让用户 `pip install -e .`。不要用 `conda run` / 手动拼 `sys.argv` 绕过入口。
 
 ```bash
-# 启动服务（阻塞式，推荐在后台运行）
-win-use serve
+# 启动常驻进程（阻塞式，通过 stdin/stdout 交互）
+python -m win_use
 
-# 或指定端口
-win-use serve --port 9876
-
-# 客户端命令自动检测并连接 serve，无需额外配置
-win-use read --window "记事本" --mode compact
-win-use click --id 5
+# 每行发送一个 JSON 命令，每行收到一个 JSON 响应
+{"cmd": "apps", "args": {"action": "list"}}
+{"cmd": "read", "args": {"window": "记事本", "mode": "compact"}}
+{"cmd": "click", "args": {"id": 5}}
 ```
 
-有 serve 运行时 CLI 命令延迟从 ~500ms 降到 ~5ms（纯 socket 通信），且窗口枚举缓存跨命令复用。
+或通过管道一次性发送多条命令：
+
+```bash
+echo '{"cmd":"apps","args":{"action":"list"}}' | python -m win_use
+```
+
+stdin 关闭（EOF）时进程优雅退出。
+
+## REPL 协议
+
+请求（每行一个 JSON，UTF-8）：
+```json
+{"cmd": "read", "args": {"window": "记事本", "mode": "compact"}}
+```
+
+响应（每行一个 JSON，UTF-8）：
+```json
+{"success": true, "mode": "compact", "elements": [...]}
+```
+
+错误：
+```json
+{"success": false, "error": "...", "error_type": "ValueError"}
+```
+
+## 命令集
+
+| cmd | args 关键字段 | 说明 |
+|-----|-------------|------|
+| `read` | window, active, depth, mode, all | 读 UIA 树，填充内存缓存 |
+| `click` | id 或 x/y, button, double | 点击；double=true 为双击 |
+| `type` | text, delay, preserve_outer_quotes | 输入文本 |
+| `keys` | keys | 组合键 |
+| `scroll` | direction, amount, x, y | 滚动 |
+| `move` | x, y | 移动鼠标 |
+| `drag` | from_x, from_y, to_x, to_y | 拖拽 |
+| `wait` | seconds | 等待 |
+| `wait_for` | selector, window, active, timeout, state | 条件等待 |
+| `apps` | action(list/focus/launch/close/minimize/maximize), name, index, timeout | 窗口管理 |
+| `screenshot` | output, base64, quality, window, overlay_grid | 截图 |
+| `locate_vision` | window, target, model, spacing | 视觉定位 |
+| `shell` | command, timeout | 本地 PowerShell 执行 |
 
 ## 执行策略：默认走快速路径
 
@@ -60,65 +81,45 @@ win-use click --id 5
 
 | 场景 | 推荐方式 |
 |---|---|
-| 已知窗口、操作流程和目标元素名称 | **一次 `batch` 完成**，优先使用 selector |
-| 已知窗口，但不清楚元素名称或结构 | 一次目标窗口 `compact read`，然后**合并为 `batch`** |
+| 已知窗口、操作流程和目标元素名称 | 逐条发送命令，优先使用 selector + `wait_for` |
+| 已知窗口，但不清楚元素名称或结构 | 一次目标窗口 `compact read`，然后逐条操作 |
 | 未知窗口名称 | 一次 `apps list`，确认后进入快速路径 |
-| 多步探索式交互 | 先 `win-use serve`，再逐条命令（每次 ~5ms 延迟） |
+| 多步探索式交互 | 常驻进程内逐条命令（每次无启动开销） |
 | selector 找不到元素、界面结构未知 | 对目标窗口执行 `full read` 诊断 |
-| 需要确认业务结果 | 在 batch 末尾使用 `wait_for` 或 `screenshot` |
+| 需要确认业务结果 | 使用 `wait_for` 或 `screenshot` |
 
 ### 性能规则
 
-0. **多步操作必须合并为 `batch`**。Agent 的首要优化规则：任何 2 步及以上的操作流程，第一选择永远是写入 batch JSON 文件并执行 `win-use batch`。逐条 CLI 调用会产生 500ms/次的进程启动惩罚。
-1. **已知流程不可使用逐条 CLI**。必须优先使用 `batch`，避免 Agent 与 CLI 多次往返。
-2. **已知目标元素名称时直接使用 selector**，不要为了获取 ID 先执行 `read`。
+1. **会话开始时启动常驻进程**，后续所有命令通过 stdin/stdout 逐条发送，无进程启动开销。
+2. **已知目标元素名称时直接使用 selector**（通过 `wait_for`），不要为了获取 ID 先执行 `read`。
 3. **只读取目标窗口**，不要默认读取全部桌面。
-4. **常规探索使用 `--mode compact`**；仅在 compact 信息不足时使用 `full`。
-5. **使用 `wait_for` 等待界面变化**（现在基于 UIA 事件通知，不再纯轮询），不要使用固定 `wait 1`、`wait 2`。
-6. **输入文字优先使用 `"delay": 0`**，通过剪贴板一次性粘贴。
+4. **常规探索使用 `mode: compact`**；仅在 compact 信息不足时使用 `full`。
+5. **使用 `wait_for` 等待界面变化**（基于 UIA 事件通知，自动降级轮询），不要使用固定 `wait 1`、`wait 2`。
+6. **输入文字优先使用 `delay: 0`**，通过剪贴板一次性粘贴。
 7. **优先使用 Name、AutomationId、ClassName 和控件类型定位**；坐标点击仅作最后降级。
 8. **不要在确定性操作之间重复 read**。只有界面结构未知或操作失败后才重新读取。
-9. `apps.focus` 会自动恢复最小化窗口；仅在布局依赖最大化尺寸时使用 `apps.maximize`。
-10. `default_timeout` 是最大等待时间，不是固定休眠；通常保持 `5` 秒即可。
-11. `default_settle` 推荐 `0.03-0.1` 秒。界面加载慢时增加 `wait_for`，不要全局增大 settle。
-12. 已知目标窗口时不要在 batch 中调用 `apps.list`，避免返回无关窗口和浪费 token。
-13. **普通文字只能使用 `type`，快捷键才使用 `keys`**。不要用 `keys` 输入搜索词或消息。
-14. `type` 默认使用字面量粘贴，并移除 Agent/shell 意外传入的整段外层引号。
-15. 复杂文本优先放入 batch JSON 文件或通过 `win-use type --stdin` 输入，避免 shell 多层转义。
-16. **需要多步探索时先启动 `win-use serve`**，后续逐条命令延迟从 ~500ms 降到 ~5ms。
-17. **batch JSON 文件使用 `--cleanup` 自动删除**，或写入 `%TEMP%/win-use/batch/` 目录避免项目内产生垃圾文件。
-18. **首次探索先用 `win-use read`（windows 模式）扫描窗口**，然后再 `win-use read --window "X"` 深入目标窗口，避免一次性深读全部窗口。
+9. `apps focus` 会自动恢复最小化窗口；仅在布局依赖最大化尺寸时使用 `apps maximize`。
+10. `timeout` 是最大等待时间，不是固定休眠；通常保持 `5` 秒即可。
+11. 已知目标窗口时不要调用 `apps list`，避免返回无关窗口和浪费 token。
+12. **普通文字只能使用 `type`，快捷键才使用 `keys`**。不要用 `keys` 输入搜索词或消息。
+13. `type` 默认使用字面量粘贴，并移除 Agent/shell 意外传入的整段外层引号。
+14. **首次探索先用 `read`（windows 模式）扫描窗口**，然后再 `read --window "X"` 深入目标窗口。
 
-### 快速路径模板
+### 快速路径示例
+
+逐条发送命令（常驻进程内，无启动开销）：
 
 ```json
-{
-  "default_timeout": 5,
-  "default_settle": 0.05,
-  "steps": [
-    {"action": "apps.focus", "name": "目标窗口"},
-    {"action": "keys", "keys": "{Ctrl}f"},
-    {"action": "type", "text": "搜索内容", "delay": 0},
-    {
-      "action": "click",
-      "window": "目标窗口",
-      "selector": {"name": "目标项", "match": "contains"},
-      "timeout": 5
-    },
-    {"action": "wait_for", "window": "目标窗口", "selector": {"name": "预期元素"}},
-    {"action": "screenshot", "output": "result.png"}
-  ]
-}
+{"cmd": "apps", "args": {"action": "focus", "name": "目标窗口"}}
+{"cmd": "keys", "args": {"keys": "{Ctrl}f"}}
+{"cmd": "type", "args": {"text": "搜索内容", "delay": 0}}
+{"cmd": "wait_for", "args": {"window": "目标窗口", "selector": {"name": "目标项", "match": "contains"}, "timeout": 5}}
+{"cmd": "click", "args": {"id": 5}}
+{"cmd": "wait_for", "args": {"window": "目标窗口", "selector": {"name": "预期元素"}}}
+{"cmd": "screenshot", "args": {"output": "result.png"}}
 ```
 
-保存为 JSON 后一次执行：
-
-```bash
-win-use batch workflow.json
-```
-
-默认遇到失败立即停止。检查最终输出中的顶层 `success`、每一步 `success`、
-`elapsed_ms`、`result` 或 `error`。
+每条命令返回 `success` 和结构化结果。根据结果决定下一步操作。
 
 ## 探索工作流
 
@@ -126,8 +127,8 @@ win-use batch workflow.json
 
 ### 第一步：列出所有窗口
 
-```bash
-win-use apps list
+```json
+{"cmd": "apps", "args": {"action": "list"}}
 ```
 
 输出当前所有可见窗口，包含 `id`、`name`、`class_name`、`automation_id`、`state`。
@@ -135,25 +136,25 @@ win-use apps list
 
 ### 第二步：读取目标窗口的元素树
 
-```bash
-# 先扫描所有窗口（windows 模式 = tree -L 1，极快）
-win-use read
+```json
+// 先扫描所有窗口（windows 模式 = tree -L 1，极快）
+{"cmd": "read", "args": {}}
 
-# 对目标窗口做 compact 读取（只输出可交互元素）
-win-use read --window "窗口名称" --mode compact
+// 对目标窗口做 compact 读取（只输出可交互元素）
+{"cmd": "read", "args": {"window": "窗口名称", "mode": "compact"}}
 
-# 深度诊断时用 full 模式
-win-use read --window "窗口名称" --mode full --depth 8
+// 深度诊断时用 full 模式
+{"cmd": "read", "args": {"window": "窗口名称", "mode": "full", "depth": 8}}
 
-# 只读活动窗口
-win-use read --active --mode compact
+// 只读活动窗口
+{"cmd": "read", "args": {"active": true, "mode": "compact"}}
 ```
 
 读取模式由 Agent 按需选择：
 
-- `--mode windows`（**无 --window 时的默认**）：只列出顶层窗口元数据（名、类、状态、坐标），不做深度遍历。等同于 `tree -L 1`，极快，适合确认窗口存在与否。
-- `--mode compact`（**有 --window 时的默认**）：只输出目标窗口和可交互元素，适合常规操作。
-- `--mode full`：完整 UIA JSON 树，适合诊断、探索未知界面。
+- `windows`（**无 window 时的默认**）：只列出顶层窗口元数据（名、类、状态、坐标），不做深度遍历。等同于 `tree -L 1`，极快。
+- `compact`（**有 window 时的默认**）：只输出目标窗口和可交互元素，适合常规操作。
+- `full`：完整 UIA JSON 树，适合诊断、探索未知界面。
 
 输出中每个元素包含：
 - `id` — 运行时分配的整数 ID（后续操作用此 ID 定位）
@@ -172,84 +173,58 @@ win-use read --active --mode compact
 
 ### 第四步：逐步操作
 
-```bash
-# 聚焦窗口（支持 Name、ClassName、AutomationId 多字段匹配）
-win-use apps focus "记事本"              # 第一个匹配
-win-use apps focus "记事本" --index 1    # 第二个匹配
+```json
+// 聚焦窗口（支持 Name、ClassName、AutomationId 多字段匹配）
+{"cmd": "apps", "args": {"action": "focus", "name": "记事本"}}
+{"cmd": "apps", "args": {"action": "focus", "name": "记事本", "index": 1}}
 
-# 点击元素（id 来自 read 输出）
-win-use click --id 5
+// 点击元素（id 来自 read 输出）
+{"cmd": "click", "args": {"id": 5}}
 
-# 或按坐标点击
-win-use click --x 300 --y 200
+// 或按坐标点击
+{"cmd": "click", "args": {"x": 300, "y": 200}}
 
-# 输入文字
-win-use type "hello world"
+// 输入文字
+{"cmd": "type", "args": {"text": "hello world"}}
 
-# 按键
-win-use keys "{Ctrl}c"
-win-use keys "{Enter}"
-win-use keys "{Win}r"
+// 按键
+{"cmd": "keys", "args": {"keys": "{Ctrl}c"}}
+{"cmd": "keys", "args": {"keys": "{Enter}"}}
+{"cmd": "keys", "args": {"keys": "{Win}r"}}
 
-# 滚动
-win-use scroll down --amount 300
+// 滚动
+{"cmd": "scroll", "args": {"direction": "down", "amount": 300}}
 
-# 截图确认结果
-win-use screenshot -o result.png
+// 截图确认结果
+{"cmd": "screenshot", "args": {"output": "result.png"}}
 ```
 
 ### 第五步：验证
 
 操作后用 screenshot 确认界面变化是否符合预期。
 
-## 快速批处理
-
-已知操作流程时，优先使用 `batch` 在单个进程中完成多步操作，减少 Agent 与 CLI
-往返以及重复读取完整 UIA 树：
-
-```bash
-win-use batch examples/wechat-fast.json
-
-# 执行后自动删除临时 worklow 文件
-win-use batch /tmp/myflow.json --cleanup
-```
-
 ### 截图辅助定位（opaque app 降级策略）
 
 部分应用（Qt 自绘、Chrome Web App、Electron）不通过 UIA 暴露内部控件。
 `read` 的 compact/full 输出中会包含 `opaque_app: true` 标记，Agent 应自动降级为截图定位：
 
-```bash
-# 第一步：检测 opaque
-win-use read --window "LobeHub" --mode compact
-# → {"opaque_app": true, "opaque_reason": "共 11 个元素...无实际交互控件"}
-
-# 第二步：截图降级
-win-use screenshot --window "LobeHub" -o lobehub.png
-# 或 base64 用于视觉模型分析
-win-use screenshot --window "LobeHub" --base64 -b
-
-# 第三步：视觉模型分析截图获得元素坐标
-# (Agent 内部处理)
-
-# 第四步：坐标点击 + 输入
-win-use click --x 800 --y 1020
-win-use type "提问内容" --delay 0
-win-use keys "{Enter}"
-```
-
-batch 中对应写法：
-
 ```json
-{
-  "steps": [
-    {"action": "read", "window": "LobeHub", "mode": "compact"},
-    {"action": "screenshot", "window": "LobeHub", "base64": true},
-    {"action": "click", "x": 800, "y": 1020},
-    {"action": "type", "text": "提问内容", "delay": 0},
-    {"action": "keys", "keys": "{Enter}"}
-  ]
-}
+// 第一步：检测 opaque
+{"cmd": "read", "args": {"window": "LobeHub", "mode": "compact"}}
+// → {"opaque_app": true, "opaque_reason": "共 11 个元素...无实际交互控件"}
+
+// 第二步：截图降级
+{"cmd": "screenshot", "args": {"window": "LobeHub", "output": "lobehub.png"}}
+// 或 base64 用于视觉模型分析
+{"cmd": "screenshot", "args": {"window": "LobeHub", "base64": true}}
+
+// 第三步：视觉模型分析截图获得元素坐标
+// (Agent 内部处理)
+
+// 第四步：坐标点击 + 输入
+{"cmd": "click", "args": {"x": 800, "y": 1020}}
+{"cmd": "type", "args": {"text": "提问内容", "delay": 0}}
+{"cmd": "keys", "args": {"keys": "{Enter}"}}
 ```
 
 **Agent 截图降级决策树**：
@@ -266,120 +241,57 @@ batch 中对应写法：
 1. 截图 → 2. 读取截图文件 → 3. 视觉模型分析 → 4. 提取精确坐标 → 5. 坐标点击
 ```
 
-```bash
-# 步骤 1+2：截图并输出 base64
-python -m win_use screenshot --window "目标窗口" --base64
-
-# 步骤 3+4：Agent 将 base64 发送给视觉模型（GPT-4V / Claude Vision），
-# 提示词："图中输入框的屏幕绝对坐标（x, y）是多少？"
-
-# 步骤 5：使用视觉模型返回的精确坐标点击
-python -m win_use click --x <视觉模型返回的x> --y <视觉模型返回的y>
-```
-
 **禁止行为**：
 - ❌ 截图后不看图，用"窗口左上角 + 估算偏移"盲猜坐标
 - ❌ 用窗口 bounds 推算"大概中间是输入框"
 - ❌ 截了 base64 但不传给视觉模型分析
 
 **截图技巧**：
-- `--window "X"` 只截取目标窗口区域，减少无关信息和 token 消耗
-- `--base64` 返回 base64 编码，直接供视觉模型使用
-- `--overlay` 在截图上叠加编号坐标点网格，返回每个点的屏幕绝对坐标映射
-- batch 中截图后用 `click --x/--y` 坐标点击，不可用 selector（元素未暴露）
+- `window: "X"` 只截取目标窗口区域，减少无关信息和 token 消耗
+- `base64: true` 返回 base64 编码，直接供视觉模型使用
+- `overlay_grid` 在截图上叠加编号坐标点网格，返回每个点的屏幕绝对坐标映射
 
-### 编号坐标点叠加（`--overlay`）
+### 编号坐标点叠加（`overlay_grid`）
 
-Opaque app 截图时可启用 `--overlay`，在窗口截图上叠加等间距编号红点：
+Opaque app 截图时可启用 `overlay_grid`，在窗口截图上叠加等间距编号红点：
 
-```bash
-python -m win_use screenshot --window "LobeHub" --overlay -o lobehub.png
+```json
+{"cmd": "screenshot", "args": {"window": "LobeHub", "overlay_grid": 150, "output": "lobehub.png"}}
 ```
 
-**但 Agent 不应直接使用 `--overlay` + 手动分析**。应使用 `locate-vision` 命令，该命令内部完成截图→overlay→视觉模型→坐标的完整闭环：
+**但 Agent 不应直接使用 `overlay_grid` + 手动分析**。应使用 `locate_vision` 命令，该命令内部完成截图→overlay→视觉模型→坐标的完整闭环：
 
-```bash
-# 一步到位：截图+overlay+视觉模型 → 直接返回屏幕坐标
-python -m win_use locate-vision --window "LobeHub" --target "页面底部的聊天输入框"
+```json
+// 一步到位：截图+overlay+视觉模型 → 直接返回屏幕坐标
+{"cmd": "locate_vision", "args": {"window": "LobeHub", "target": "页面底部的聊天输入框"}}
 
-# 返回：
-# {"success": true, "screen_x": 1580, "screen_y": 1098, "nearest_dot": 645, "offset": {"x": 35, "y": -12}}
+// 返回：
+// {"success": true, "screen_x": 1580, "screen_y": 1098, "nearest_dot": 645, "offset": {"x": 35, "y": -12}}
 ```
 
 **Agent 完整开源路径**：
-```bash
-python -m win_use apps focus "微信"
-python -m win_use read --window "微信" --mode compact
-# → {"opaque_app": true}  ← 检测到 opaque
-
-python -m win_use locate-vision --window "微信" --target "底部消息输入框"
-# → {"screen_x": 1200, "screen_y": 980}  ← 直接可用的屏幕坐标
-
-python -m win_use click --x 1200 --y 980
-python -m win_use type "消息" --delay 0
-python -m win_use keys "{Enter}"
-```
-
-**batch 中对应写法**：
-
 ```json
-{
-  "steps": [
-    {"action": "read", "window": "微信", "mode": "compact"},
-    {"action": "locate_vision", "window": "微信", "target": "底部消息输入框"},
-    {"action": "click", "x": "$locate_vision.screen_x", "y": "$locate_vision.screen_y"},
-    {"action": "type", "text": "消息", "delay": 0},
-    {"action": "keys", "keys": "{Enter}"}
-  ]
-}
+{"cmd": "apps", "args": {"action": "focus", "name": "微信"}}
+{"cmd": "read", "args": {"window": "微信", "mode": "compact"}}
+// → {"opaque_app": true}  ← 检测到 opaque
+
+{"cmd": "locate_vision", "args": {"window": "微信", "target": "底部消息输入框"}}
+// → {"screen_x": 1200, "screen_y": 980}  ← 直接可用的屏幕坐标
+
+{"cmd": "click", "args": {"x": 1200, "y": 980}}
+{"cmd": "type", "args": {"text": "消息", "delay": 0}}
+{"cmd": "keys", "args": {"keys": "{Enter}"}}
 ```
 
-**`locate-vision` 参数**：
-- `--window` / `-w`：目标窗口名称
-- `--target` / `-t`：要定位的元素自然语言描述
-- `--model`：视觉模型，默认 `gpt-4o`
-- `--api-key`：API Key（默认用 `OPENAI_API_KEY` 环境变量）
-- `--base-url`：自定义 API 端点
-- `--spacing`：overlay 网格间距，默认 150px
+**`locate_vision` 参数**：
+- `window`：目标窗口名称
+- `target`：要定位的元素自然语言描述
+- `model`：视觉模型，默认 `gpt-4o`
+- `api_key`：API Key（默认用 `OPENAI_API_KEY` 环境变量）
+- `base_url`：自定义 API 端点
+- `spacing`：overlay 网格间距，默认 150px
 
-**返回字段**：`screen_x`, `screen_y`（可直接用于 `click --x/--y`）、`nearest_dot`, `offset`
-
-工作流支持 `apps.*`、`read`、`click`、`double_click`、`type`、`keys`、`scroll`、
-`move`、`drag`、`wait`、`wait_for`、`screenshot`。每一步返回：
-
-- `success`：该步骤是否执行成功
-- `elapsed_ms`：步骤耗时
-- `result` 或 `error`：结构化结果或错误
-
-`success: true` 表示操作已成功派发或条件已满足，不代表业务目标一定完成。例如按下
-发送键成功并不能证明消息已送达。关键步骤应追加 `wait_for` 或截图验证。
-
-`click` 可以直接使用 selector，无需先 `read` 获取 ID，并会自动等待元素出现：
-
-```json
-{
-  "action": "click",
-  "window": "Weixin",
-  "selector": {
-    "name": "长夜无荒",
-    "match": "contains",
-    "type": "ListItem"
-  },
-  "timeout": 5
-}
-```
-
-等待界面变化时使用条件等待，避免固定等待：
-
-```json
-{
-  "action": "wait_for",
-  "window": "Weixin",
-  "selector": {"name": "长夜无荒"},
-  "state": "present",
-  "timeout": 5
-}
-```
+**返回字段**：`screen_x`, `screen_y`（可直接用于 `click`）、`nearest_dot`, `offset`
 
 ### Selector 支持字段
 
@@ -401,20 +313,32 @@ python -m win_use keys "{Enter}"
 - 使用 `index` 选择多个匹配中的第 N 个
 - 使用 `timeout` 等待目标出现；条件一满足就立即继续，不会等待完整超时时间
 
+`wait_for` 可以直接使用 selector，无需先 `read` 获取 ID，并会自动等待元素出现：
+
+```json
+{"cmd": "wait_for", "args": {"window": "Weixin", "selector": {"name": "长夜无荒", "match": "contains", "type": "ListItem"}, "timeout": 5}}
+```
+
+等待界面变化时使用条件等待，避免固定等待：
+
+```json
+{"cmd": "wait_for", "args": {"window": "Weixin", "selector": {"name": "长夜无荒"}, "state": "present", "timeout": 5}}
+```
+
 ### 快速失败恢复
 
-batch 某一步失败时，不要从头重复整个慢流程：
+某一步失败时，不要从头重复整个慢流程：
 
-1. 查看失败步骤的 `error` 和 `elapsed_ms`。
+1. 查看失败响应的 `error` 和 `error_type`。
 2. selector 过宽时增加 `type`、`automation_id` 或改用 `match: exact`。
 3. selector 找不到时，仅对目标窗口执行一次：
 
-```bash
-win-use read --window "目标窗口" --mode compact --depth 6
+```json
+{"cmd": "read", "args": {"window": "目标窗口", "mode": "compact", "depth": 6}}
 ```
 
-4. compact 仍不足时，再使用 `--mode full`。
-5. 修正 selector 后重新执行剩余 batch。
+4. compact 仍不足时，再使用 `mode: full`。
+5. 修正 selector 后重新发送 `wait_for` 或 `click`。
 
 ### 成功语义
 
@@ -428,37 +352,17 @@ win-use read --window "目标窗口" --mode compact --depth 6
 
 普通文本输入：
 
-```bash
-win-use type "长夜无荒"
+```json
+{"cmd": "type", "args": {"text": "长夜无荒"}}
 ```
 
-shell 用来包裹参数的引号不会被输入。即使 Agent 误把整段外层引号作为文本传入，
-`type` 默认也会移除最多三层匹配的单引号、双引号或中文弯引号。
-
-需要输入包含 shell 特殊字符的复杂文本时，优先使用 stdin：
-
-```bash
-echo '包含 "引号"、{花括号} 的内容' | win-use type --stdin
-```
-
-`--stdin` 默认移除管道附带的一个末尾换行，避免意外触发搜索或发送。确实需要保留该
-换行时添加 `--preserve-stdin-newline`。
+即使 Agent 误把整段外层引号作为文本传入，`type` 默认也会移除最多三层匹配的单引号、
+双引号或中文弯引号。
 
 确实需要在输入内容最外层保留引号：
 
-```bash
-win-use type '"需要保留引号"' --preserve-outer-quotes
-```
-
-batch 中对应写法：
-
 ```json
-{
-  "action": "type",
-  "text": "\"需要保留引号\"",
-  "preserve_outer_quotes": true,
-  "delay": 0
-}
+{"cmd": "type", "args": {"text": "\"需要保留引号\"", "preserve_outer_quotes": true}}
 ```
 
 - JSON 字段语法中的 `"text": "长夜无荒"` 外层引号只是 JSON 语法，不会被输入。
@@ -474,57 +378,55 @@ batch 中对应写法：
 2. **AutomationId**（UIA 系统标识，最稳定）
 3. **ClassName**（窗口类名）
 
-当匹配到多个窗口时，默认操作第一个。使用 `--index N` 选择其他匹配项。
+当匹配到多个窗口时，默认操作第一个。使用 `index` 选择其他匹配项。
 
-```bash
-# 示例：有两个"记事本"窗口
-win-use apps focus "记事本"           # 聚焦第一个
-win-use apps focus "记事本" --index 1 # 聚焦第二个
+```json
+// 示例：有两个"记事本"窗口
+{"cmd": "apps", "args": {"action": "focus", "name": "记事本"}}           // 聚焦第一个
+{"cmd": "apps", "args": {"action": "focus", "name": "记事本", "index": 1}} // 聚焦第二个
 ```
 
 ## 常见操作模式（探索或降级）
 
-以下逐条命令仅用于探索未知界面或修复失败步骤。已知流程不要逐条调用，应合并为 batch。
+以下逐条命令用于探索未知界面或修复失败步骤。
 
 ### 打开应用并操作
 
-```bash
-win-use apps launch notepad
-# 等待启动后
-win-use apps focus "记事本"
-win-use read --window "记事本" --compact
-# 找到编辑区的 id，然后
-win-use click --id <编辑区ID>
-win-use type "输入内容"
+```json
+{"cmd": "apps", "args": {"action": "launch", "name": "notepad"}}
+{"cmd": "apps", "args": {"action": "focus", "name": "记事本"}}
+{"cmd": "read", "args": {"window": "记事本", "mode": "compact"}}
+{"cmd": "click", "args": {"id": 1}}
+{"cmd": "type", "args": {"text": "输入内容"}}
 ```
 
 ### 在浏览器中操作
 
-```bash
-win-use apps list                    # 找到浏览器窗口
-win-use read --window "Chrome" --compact
-win-use click --id <地址栏ID>
-win-use type "https://example.com"
-win-use keys "{Enter}"
+```json
+{"cmd": "apps", "args": {"action": "list"}}
+{"cmd": "read", "args": {"window": "Chrome", "mode": "compact"}}
+{"cmd": "click", "args": {"id": 1}}
+{"cmd": "type", "args": {"text": "https://example.com"}}
+{"cmd": "keys", "args": {"keys": "{Enter}"}}
 ```
 
 ### 处理多窗口场景
 
-```bash
-win-use apps list
-# 如果输出显示两个 VS Code 窗口：
-#   { "id": 3, "name": "app.ts - VS Code", ... }
-#   { "id": 5, "name": "README.md - VS Code", ... }
+```json
+{"cmd": "apps", "args": {"action": "list"}}
+// 如果输出显示两个 VS Code 窗口：
+//   { "id": 3, "name": "app.ts - VS Code", ... }
+//   { "id": 5, "name": "README.md - VS Code", ... }
 
-# 用具体的名称子串区分
-win-use apps focus "app.ts"
-# 或匹配 class_name
-win-use apps focus "MozillaWindowClass" --index 0
+// 用具体的名称子串区分
+{"cmd": "apps", "args": {"action": "focus", "name": "app.ts"}}
+// 或匹配 class_name
+{"cmd": "apps", "args": {"action": "focus", "name": "MozillaWindowClass", "index": 0}}
 ```
 
 ## 注意事项
 
-- 每次 `win-use read` 会刷新元素 ID；ID 会跨 CLI 进程缓存，下一次 read 后旧 ID 失效
+- 每次 `read` 会刷新元素 ID；内存缓存跨命令复用，下一次 read 后旧 ID 失效
 - `safe_name()` 返回空字符串时，优先用 `automation_id` 或 `class_name` 定位窗口
 - 动态标题的窗口（浏览器、IDE）建议用 `class_name` 匹配
 - 先 focus 窗口再 read，确保读到的是目标窗口的前台状态
