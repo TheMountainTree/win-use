@@ -1,12 +1,14 @@
+import io
+import json
 import os
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 import uiautomation as auto
-from typer.testing import CliRunner
 
-from win_use import actions, apps, batch, cache, cli, reader, selectors, utils
+from win_use import actions, apps, cache, dispatch, reader, selectors, utils
 
 
 class FakeRect:
@@ -180,6 +182,15 @@ class CacheAndActionTests(unittest.TestCase):
         self.assertEqual(7, loaded[7]["id"])
         self.assertEqual({"path": [0, 0]}, loaded[7]["locator"])
 
+    def test_build_memory_cache(self):
+        mem = cache.build_memory_cache([
+            {"id": 1, "bounds": {"x": 0, "y": 0, "w": 10, "h": 10}, "name": "A", "type": "Button", "_locator": {"path": [0]}},
+            {"id": 2, "bounds": {"x": 5, "y": 5, "w": 20, "h": 20}, "name": "B", "type": "Pane", "_locator": None},
+        ])
+        self.assertEqual({1, 2}, set(mem))
+        self.assertEqual("A", mem[1]["name"])
+        self.assertEqual({"path": [0]}, mem[1]["locator"])
+
     def test_click_uses_resolved_current_bounds(self):
         _, _, button = make_tree()
         cached = {7: {
@@ -246,66 +257,224 @@ class SelectorTests(unittest.TestCase):
         self.assertIs(button, result)
 
 
-class BatchTests(unittest.TestCase):
-    def test_execute_batch_returns_structured_step_results(self):
-        workflow = {"steps": [{"action": "keys", "keys": "{Enter}"}, {"action": "wait", "seconds": 0}]}
-        with patch.object(batch, "run_step", side_effect=[{"action": "keys"}, {"action": "wait"}]):
-            result = batch.execute_batch(workflow)
-        self.assertTrue(result["success"])
-        self.assertEqual(2, result["completed_steps"])
-        self.assertTrue(result["steps"][0]["success"])
-        self.assertIn("elapsed_ms", result["steps"][0])
+class DispatchTests(unittest.TestCase):
+    """直接调用 dispatch(cmd, args, ctx) 验证各命令分发。"""
 
-    def test_execute_batch_stops_on_error(self):
-        workflow = {"steps": [{"action": "keys", "keys": "{Enter}"}, {"action": "wait", "seconds": 0}]}
-        with patch.object(batch, "run_step", side_effect=RuntimeError("failed")):
-            result = batch.execute_batch(workflow)
+    def test_unknown_command(self):
+        ctx = dispatch.LoopContext()
+        result = dispatch.dispatch("nope", {}, ctx)
         self.assertFalse(result["success"])
-        self.assertEqual(1, result["completed_steps"])
-        self.assertEqual("RuntimeError", result["steps"][0]["error_type"])
+        self.assertEqual("UnknownCommand", result["error_type"])
 
-    def test_selector_click_waits_and_returns_element(self):
-        _, _, button = make_tree()
+    def test_read_fills_memory_cache(self):
+        window, _, _ = make_tree()
+        ctx = dispatch.LoopContext()
         with (
-            patch.object(batch, "wait_for_element", return_value=button),
-            patch.object(batch, "_click_element", return_value={"success": True, "action": "click"}),
+            patch.object(reader, "get_top_level_windows", return_value=[window]),
+            patch.object(reader, "get_active_window", return_value=window),
+            patch.object(reader, "get_screen_size", return_value=(1920, 1080)),
+            patch.object(cache, "save_elements_cache"),
         ):
-            result = batch.run_step({
-                "action": "click",
-                "selector": {"name": "保存"},
-            })
+            result = dispatch.dispatch("read", {"mode": "full"}, ctx)
         self.assertTrue(result["success"])
-        self.assertEqual("保存", result["element"]["name"])
+        self.assertEqual(3, result["element_count"])
+        # 内存缓存已填充
+        self.assertEqual(3, len(ctx.element_cache))
+        self.assertIn(1, ctx.element_cache)
+
+    def test_click_by_id_uses_memory_cache(self):
+        _, _, button = make_tree()
+        ctx = dispatch.LoopContext()
+        ctx.element_cache = {5: {
+            "id": 5,
+            "bounds": {"x": 100, "y": 120, "w": 80, "h": 30},
+            "locator": {"path": [0, 0]},
+        }}
+        with (
+            patch.object(actions, "resolve_element", return_value=button),
+            patch.object(actions.auto, "Click") as click,
+            patch.object(actions.time, "sleep"),
+        ):
+            result = dispatch.dispatch("click", {"id": 5}, ctx)
+        self.assertTrue(result["success"])
+        click.assert_called_once()
+
+    def test_click_by_coords(self):
+        ctx = dispatch.LoopContext()
+        with (
+            patch.object(actions.auto, "Click") as click,
+            patch.object(actions.time, "sleep"),
+        ):
+            result = dispatch.dispatch("click", {"x": 100, "y": 200}, ctx)
+        self.assertTrue(result["success"])
+        click.assert_called_once_with(100, 200)
+
+    def test_click_without_target(self):
+        ctx = dispatch.LoopContext()
+        result = dispatch.dispatch("click", {}, ctx)
+        self.assertFalse(result["success"])
+        self.assertEqual("MissingArgument", result["error_type"])
+
+    def test_click_id_without_cache(self):
+        ctx = dispatch.LoopContext()
+        result = dispatch.dispatch("click", {"id": 1}, ctx)
+        self.assertFalse(result["success"])
+        self.assertEqual("CacheEmpty", result["error_type"])
+
+    def test_type_dispatch(self):
+        ctx = dispatch.LoopContext()
+        with (
+            patch("pyperclip.copy"),
+            patch.object(actions.auto, "SendKeys"),
+            patch.object(actions.time, "sleep"),
+        ):
+            result = dispatch.dispatch("type", {"text": "hello"}, ctx)
+        self.assertTrue(result["success"])
+        self.assertEqual("hello", result["text"])
+
+    def test_type_missing_text(self):
+        ctx = dispatch.LoopContext()
+        result = dispatch.dispatch("type", {}, ctx)
+        self.assertFalse(result["success"])
+
+    def test_keys_dispatch(self):
+        ctx = dispatch.LoopContext()
+        with (
+            patch.object(actions.auto, "SendKeys"),
+            patch.object(actions.time, "sleep"),
+        ):
+            result = dispatch.dispatch("keys", {"keys": "{Enter}"}, ctx)
+        self.assertTrue(result["success"])
+        self.assertEqual("{Enter}", result["keys"])
+
+    def test_wait_dispatch(self):
+        ctx = dispatch.LoopContext()
+        with patch.object(actions.time, "sleep"):
+            result = dispatch.dispatch("wait", {"seconds": 0}, ctx)
+        self.assertTrue(result["success"])
+
+    def test_apps_list_dispatch(self):
+        window, _, _ = make_tree()
+        ctx = dispatch.LoopContext()
+        with patch.object(apps, "get_top_level_windows", return_value=[window]):
+            result = dispatch.dispatch("apps", {"action": "list"}, ctx)
+        self.assertTrue(result["success"])
+
+    def test_apps_unknown_action(self):
+        ctx = dispatch.LoopContext()
+        result = dispatch.dispatch("apps", {"action": "fly"}, ctx)
+        self.assertFalse(result["success"])
+        self.assertEqual("UnknownAction", result["error_type"])
+
+    def test_shell_dispatch(self):
+        ctx = dispatch.LoopContext()
+        result = dispatch.dispatch("shell", {"command": "echo hi"}, ctx)
+        self.assertTrue(result["success"])
+        self.assertIn("hi", result["stdout"])
+
+    def test_shell_missing_command(self):
+        ctx = dispatch.LoopContext()
+        result = dispatch.dispatch("shell", {}, ctx)
+        self.assertFalse(result["success"])
+
+    def test_dispatch_catches_exceptions(self):
+        ctx = dispatch.LoopContext()
+        with patch.object(actions, "wait", side_effect=RuntimeError("boom")):
+            result = dispatch.dispatch("wait", {"seconds": 1}, ctx)
+        self.assertFalse(result["success"])
+        self.assertEqual("RuntimeError", result["error_type"])
+        self.assertEqual("boom", result["error"])
 
 
-class CliTests(unittest.TestCase):
-    def test_type_stdin_removes_pipe_newline(self):
-        runner = CliRunner()
-        with patch.object(actions, "type_text", return_value={"success": True}) as type_text:
-            result = runner.invoke(cli.app, ["type", "--stdin"], input='"搜索词"\n')
+class ReplProtocolTests(unittest.TestCase):
+    """用 StringIO 模拟 stdin/stdout 验证 JSON-lines REPL 往返。"""
 
-        self.assertEqual(0, result.exit_code)
-        type_text.assert_called_once_with(
-            '"搜索词"',
-            delay=0,
-            preserve_outer_quotes=False,
+    def test_single_command_roundtrip(self):
+        import win_use.cli as cli_mod
+        stdin = io.StringIO(json.dumps({"cmd": "wait", "args": {"seconds": 0}}) + "\n")
+        stdout = io.StringIO()
+        with (
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+            patch.object(actions.time, "sleep"),
+        ):
+            cli_mod.main()
+        lines = [l for l in stdout.getvalue().split("\n") if l]
+        self.assertEqual(1, len(lines))
+        result = json.loads(lines[0])
+        self.assertTrue(result["success"])
+        self.assertEqual("wait", result["action"])
+
+    def test_multiple_commands(self):
+        import win_use.cli as cli_mod
+        stdin = io.StringIO(
+            json.dumps({"cmd": "wait", "args": {"seconds": 0}}) + "\n"
+            + json.dumps({"cmd": "wait", "args": {"seconds": 0}}) + "\n"
         )
+        stdout = io.StringIO()
+        with (
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+            patch.object(actions.time, "sleep"),
+        ):
+            cli_mod.main()
+        lines = [l for l in stdout.getvalue().split("\n") if l]
+        self.assertEqual(2, len(lines))
+        for line in lines:
+            self.assertTrue(json.loads(line)["success"])
 
-    def test_type_stdin_can_preserve_newline(self):
-        runner = CliRunner()
-        with patch.object(actions, "type_text", return_value={"success": True}) as type_text:
-            result = runner.invoke(
-                cli.app,
-                ["type", "--stdin", "--preserve-stdin-newline"],
-                input="两行\n",
-            )
+    def test_invalid_json_returns_error(self):
+        import win_use.cli as cli_mod
+        stdin = io.StringIO("not json\n")
+        stdout = io.StringIO()
+        with (
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+        ):
+            cli_mod.main()
+        lines = [l for l in stdout.getvalue().split("\n") if l]
+        self.assertEqual(1, len(lines))
+        result = json.loads(lines[0])
+        self.assertFalse(result["success"])
+        self.assertEqual("JSONDecodeError", result["error_type"])
 
-        self.assertEqual(0, result.exit_code)
-        type_text.assert_called_once_with(
-            "两行\n",
-            delay=0,
-            preserve_outer_quotes=False,
-        )
+    def test_unknown_command_returns_error(self):
+        import win_use.cli as cli_mod
+        stdin = io.StringIO(json.dumps({"cmd": "fly", "args": {}}) + "\n")
+        stdout = io.StringIO()
+        with (
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+        ):
+            cli_mod.main()
+        lines = [l for l in stdout.getvalue().split("\n") if l]
+        result = json.loads(lines[0])
+        self.assertFalse(result["success"])
+        self.assertEqual("UnknownCommand", result["error_type"])
+
+    def test_empty_lines_skipped(self):
+        import win_use.cli as cli_mod
+        stdin = io.StringIO("\n\n" + json.dumps({"cmd": "wait", "args": {"seconds": 0}}) + "\n\n")
+        stdout = io.StringIO()
+        with (
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+            patch.object(actions.time, "sleep"),
+        ):
+            cli_mod.main()
+        lines = [l for l in stdout.getvalue().split("\n") if l]
+        self.assertEqual(1, len(lines))
+
+    def test_eof_exits_cleanly(self):
+        import win_use.cli as cli_mod
+        stdin = io.StringIO("")
+        stdout = io.StringIO()
+        with (
+            patch.object(sys, "stdin", stdin),
+            patch.object(sys, "stdout", stdout),
+        ):
+            cli_mod.main()
+        self.assertEqual("", stdout.getvalue())
 
 
 if __name__ == "__main__":

@@ -47,6 +47,24 @@ def load_elements_cache() -> dict:
         return {}
 
 
+def build_memory_cache(elements: list[dict]) -> dict[int, dict]:
+    """从 read_screen 输出构建内存缓存 {id: record}，供常驻进程 O(1) 查找。
+
+    与文件缓存格式一致，但驻留内存，无需文件 IO。
+    """
+    cache: dict[int, dict] = {}
+    for element in elements:
+        eid = element["id"]
+        cache[eid] = {
+            "id": eid,
+            "bounds": element["bounds"],
+            "name": element.get("name", ""),
+            "type": element.get("type", "Unknown"),
+            "locator": element.get("_locator"),
+        }
+    return cache
+
+
 def strip_internal_fields(data: dict) -> dict:
     for element in data.get("elements", []):
         element.pop("_locator", None)

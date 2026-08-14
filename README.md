@@ -1,6 +1,6 @@
 # win-use — Windows Computer Use CLI for AI Agents
 
-A Python CLI that exposes the Windows UI Automation (UIA) accessibility tree as structured JSON, enabling AI agents to observe and control the Windows desktop.
+A Python package that exposes the Windows UI Automation (UIA) accessibility tree as structured JSON, enabling AI agents to observe and control the Windows desktop via a persistent loop-agent process.
 
 - **Python**: 3.10+
 - **Platform**: Windows only
@@ -21,55 +21,78 @@ pip install .
 
 ## Quick Start
 
+`python -m win_use` starts a persistent REPL process. The agent sends one JSON request per line via stdin and receives one JSON response per line via stdout.
+
 ```bash
-# List all visible windows
-win-use apps list
+# Start the loop agent process
+python -m win_use
 
-# Read the accessibility tree of a specific window (compact mode — interactive elements only)
-win-use read --window "Notepad" --mode compact
-
-# Click element ID 5 (ID comes from the `read` output above)
-win-use click --id 5
-
-# Type text
-win-use type "Hello, world!"
-
-# Send a key combination
-win-use keys "{Ctrl}s"
-
-# Take a screenshot
-win-use screenshot -o screenshot.png
+# Each line is a JSON request:
+{"cmd": "apps", "args": {"action": "list"}}
+{"cmd": "read", "args": {"window": "Notepad", "mode": "compact"}}
+{"cmd": "click", "args": {"id": 5}}
+{"cmd": "type", "args": {"text": "Hello, world!"}}
+{"cmd": "keys", "args": {"keys": "{Ctrl}s"}}
+{"cmd": "screenshot", "args": {"output": "screenshot.png"}}
 ```
+
+Or pipe commands directly:
+
+```bash
+echo '{"cmd":"apps","args":{"action":"list"}}' | python -m win_use
+```
+
+## REPL Protocol
+
+**Request** (one JSON per line, UTF-8):
+
+```json
+{"cmd": "read", "args": {"window": "记事本", "mode": "compact"}}
+```
+
+**Response** (one JSON per line, UTF-8):
+
+```json
+{"success": true, "mode": "compact", "elements": [...]} 
+```
+
+**Error**:
+
+```json
+{"success": false, "error": "...", "error_type": "ValueError"}
+```
+
+EOF (stdin closed) exits the process gracefully.
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `win-use read` | Read the UIA accessibility tree as JSON |
-| `win-use click` | Click an element (by ID or coordinates) |
-| `win-use type` | Type literal text (clipboard paste by default) |
-| `win-use keys` | Send a key combination (e.g. `{Ctrl}c`) |
-| `win-use scroll` | Scroll at a position or the cursor |
-| `win-use move` | Move the mouse to coordinates |
-| `win-use drag` | Drag from one point to another |
-| `win-use wait` | Pause for N seconds |
-| `win-use apps` | Manage windows (list / focus / launch / close / minimize / maximize) |
-| `win-use screenshot` | Capture the screen (PNG file or base64) |
-| `win-use shell` | Execute a PowerShell command |
-| `win-use batch` | Run a multi-step workflow from a JSON file |
+| cmd | args | description |
+|-----|------|-------------|
+| `read` | window, active, depth, mode, all | Read the UIA accessibility tree as JSON |
+| `click` | id or x/y, button, double | Click an element (by ID or coordinates) |
+| `type` | text, delay, preserve_outer_quotes | Type literal text (clipboard paste by default) |
+| `keys` | keys | Send a key combination (e.g. `{Ctrl}c`) |
+| `scroll` | direction, amount, x, y | Scroll at a position or the cursor |
+| `move` | x, y | Move the mouse to coordinates |
+| `drag` | from_x, from_y, to_x, to_y | Drag from one point to another |
+| `wait` | seconds | Pause for N seconds |
+| `wait_for` | selector, window, active, timeout, state | Wait until a selector matches |
+| `apps` | action, name, index, timeout | Manage windows (list / focus / launch / close / minimize / maximize) |
+| `screenshot` | output, base64, quality, window, overlay_grid | Capture the screen (PNG file or base64) |
+| `locate_vision` | window, target, model, spacing | Visual element location via OpenAI vision API |
+| `shell` | command, timeout | Execute a PowerShell command |
 
-### `win-use read`
+### `read`
 
+```json
+{"cmd": "read", "args": {"window": "Notepad", "mode": "compact", "depth": 4}}
 ```
-win-use read [--window NAME] [--active] [--depth N] [--mode full|compact] [--output file.json]
-```
 
-- `--window, -w` — filter to a specific window (fuzzy name match)
-- `--active, -a` — read only the currently active window
-- `--depth, -d` — max recursion depth (default: 4)
-- `--mode full|compact` — `full` outputs the complete tree; `compact` returns only interactive elements
-- `--all` — include background and minimized windows
-- `--output, -o` — save JSON to file
+- `window` — filter to a specific window (fuzzy name match)
+- `active` — read only the currently active window
+- `depth` — max recursion depth (default: 4)
+- `mode` — `windows` (top-level only), `full` (complete tree), `compact` (interactive elements only), `auto` (default: `windows` without `window`/`active`, else `compact`)
+- `all` — include background and minimized windows
 
 Each element in the output has:
 
@@ -79,117 +102,70 @@ Each element in the output has:
 - `bounds` — bounding rectangle (`x`, `y`, `w`, `h`)
 - `enabled`, `offscreen` — state flags
 
-### `win-use click`
-
-```
-win-use click --id N              # click an element by its read-time ID
-win-use click --x 500 --y 300     # click at screen coordinates
-win-use click --id N --double     # double-click
-win-use click --id N --button right
-```
-
-### `win-use type`
-
-```
-win-use type "some text"          # paste via clipboard (instant)
-win-use type "slow text" --delay 50  # simulate keystrokes with 50ms delay
-echo "text from pipe" | win-use type --stdin  # read from stdin
-```
-
-### `win-use keys`
-
-```
-win-use keys "{Ctrl}c"
-win-use keys "{Win}r"
-win-use keys "{Alt}{F4}"
-```
-
-### `win-use scroll`
-
-```
-win-use scroll down --amount 300
-win-use scroll up --x 500 --y 400
-```
-
-### `win-use apps`
-
-```
-win-use apps list                        # list all visible windows
-win-use apps focus "Notepad"             # bring a window to the foreground
-win-use apps launch "notepad.exe"        # start an application
-win-use apps close "Calculator"          # close a window
-win-use apps minimize "Chrome"           # minimize
-win-use apps maximize "Chrome"           # maximize
-```
-
-### `win-use screenshot`
-
-```
-win-use screenshot -o result.png         # save to file
-win-use screenshot --base64              # output base64-encoded image
-```
-
-### `win-use shell`
-
-```
-win-use shell "Get-Process | Select-Object -First 5"
-```
-
-## Batch Workflows
-
-The recommended way for AI agents to drive Windows is through **batch workflows** — a single JSON file that defines a sequence of steps executed in one process. This avoids round-trip latency between the agent and the CLI.
-
-```bash
-win-use batch workflow.json
-```
-
-### Workflow JSON Structure
+### `click`
 
 ```json
-{
-  "default_timeout": 5,
-  "default_settle": 0.05,
-  "steps": [
-    {"action": "apps.focus", "name": "WeChat"},
-    {"action": "keys", "keys": "{Ctrl}f"},
-    {"action": "type", "text": "search query", "delay": 0},
-    {
-      "action": "click",
-      "window": "WeChat",
-      "selector": {"name": "target item", "match": "contains"},
-      "timeout": 5
-    },
-    {"action": "type", "text": "Hello!", "delay": 0},
-    {"action": "keys", "keys": "{Enter}"},
-    {"action": "wait_for", "window": "WeChat", "selector": {"name": "confirmation"}},
-    {"action": "screenshot", "output": "result.png"}
-  ]
-}
+{"cmd": "click", "args": {"id": 5}}
+{"cmd": "click", "args": {"x": 500, "y": 300}}
+{"cmd": "click", "args": {"id": 5, "double": true}}
+{"cmd": "click", "args": {"id": 5, "button": "right"}}
 ```
 
-### Supported Batch Actions
+### `type`
 
-| Action | Description |
-|---|---|
-| `apps.list` | List all visible windows |
-| `apps.focus` | Focus a window by name |
-| `apps.launch` | Launch an application |
-| `apps.close` | Close a window |
-| `apps.minimize` | Minimize a window |
-| `apps.maximize` | Maximize a window |
-| `read` | Read the UIA tree |
-| `click` | Click an element (by selector or ID) |
-| `double_click` | Double-click an element |
-| `type` | Type text |
-| `keys` | Send a key combination |
-| `scroll` | Scroll at coordinates |
-| `move` | Move the mouse |
-| `drag` | Drag from one point to another |
-| `wait` | Sleep for N seconds |
-| `wait_for` | Wait until a selector matches an element |
-| `screenshot` | Take a screenshot |
+```json
+{"cmd": "type", "args": {"text": "some text"}}
+{"cmd": "type", "args": {"text": "slow text", "delay": 50}}
+{"cmd": "type", "args": {"text": "\"quoted\"", "preserve_outer_quotes": true}}
+```
 
-### Element Selectors
+### `keys`
+
+```json
+{"cmd": "keys", "args": {"keys": "{Ctrl}c"}}
+{"cmd": "keys", "args": {"keys": "{Win}r"}}
+{"cmd": "keys", "args": {"keys": "{Alt}{F4}"}}
+```
+
+### `scroll`
+
+```json
+{"cmd": "scroll", "args": {"direction": "down", "amount": 300}}
+{"cmd": "scroll", "args": {"direction": "up", "x": 500, "y": 400}}
+```
+
+### `apps`
+
+```json
+{"cmd": "apps", "args": {"action": "list"}}
+{"cmd": "apps", "args": {"action": "focus", "name": "Notepad"}}
+{"cmd": "apps", "args": {"action": "launch", "name": "notepad.exe"}}
+{"cmd": "apps", "args": {"action": "close", "name": "Calculator"}}
+{"cmd": "apps", "args": {"action": "minimize", "name": "Chrome"}}
+{"cmd": "apps", "args": {"action": "maximize", "name": "Chrome"}}
+```
+
+### `screenshot`
+
+```json
+{"cmd": "screenshot", "args": {"output": "result.png"}}
+{"cmd": "screenshot", "args": {"base64": true}}
+{"cmd": "screenshot", "args": {"window": "Notepad", "overlay_grid": 150}}
+```
+
+### `wait_for`
+
+```json
+{"cmd": "wait_for", "args": {"selector": {"name": "OK", "match": "contains"}, "window": "Notepad", "timeout": 5}}
+```
+
+### `shell`
+
+```json
+{"cmd": "shell", "args": {"command": "Get-Process | Select-Object -First 5"}}
+```
+
+## Element Selectors
 
 Selectors are JSON objects matched against UIA properties. Fuzzy matching priority: **Name > AutomationId > ClassName**.
 
@@ -199,36 +175,38 @@ Selectors are JSON objects matched against UIA properties. Fuzzy matching priori
 {"class_name": "Button", "name": "Submit"}
 ```
 
-- `match` — `contains` (default), `exact`, `startswith`, or `regex`
+- `match` — `contains` (default), `exact`, `starts_with`, or `ends_with`
 - `visible` — filter to visible elements only
 - `enabled` — filter to enabled elements only
 - `index` — pick the N-th match (0-based)
 
-### Output
+## Element Caching
 
-Each step returns `success`, `elapsed_ms`, and its `result` (or `error` on failure). The top-level response also has `success` and `total_elapsed_ms`. Execution stops on the first failure.
+`read` fills an in-memory cache (O(1) lookup) and writes a file copy (`%TEMP%/win-use/last-read.json`, overridable via `WIN_USE_CACHE_PATH`) for crash recovery and external inspection. Element IDs are only valid until the next `read`.
 
 ## Project Structure
 
 ```
 win_use/
 ├── __init__.py      # package version
-├── cli.py           # Typer CLI entry point
-├── reader.py        # UIA tree reader (full / compact mode)
+├── __main__.py      # python -m win_use entry
+├── cli.py           # stdin/stdout JSON-lines REPL main loop
+├── dispatch.py      # command dispatch core (dispatch + LoopContext)
+├── reader.py        # UIA tree reader (full / compact / windows mode)
 ├── actions.py       # mouse, keyboard, scroll, drag
 ├── apps.py          # window enumeration, focus, launch, close
-├── batch.py         # workflow engine
-├── cache.py         # temporary element cache (cross-process)
+├── cache.py         # element cache (in-memory + file persistence)
 ├── locator.py       # element resolution from cached locators
 ├── selectors.py     # selector matching & wait_for
 ├── screen.py        # screenshot capture
+├── vision.py        # visual element location (OpenAI vision API)
 └── utils.py         # safe UIA property reads, window filtering
 ```
 
 ## Design Principles
 
 - **AI-first** — all output is structured JSON; no human-readable formatting
-- **Stateless CLI** — each command runs in its own process; element references persist via a temporary cache file
+- **Loop agent** — a persistent process reuses COM context across commands, eliminating ~500ms per-call startup overhead
 - **Progressive enhancement** — coordinate clicks → ID-based clicks → semantic selectors, each layer increasing robustness
 - **Fault-tolerant** — all UIA property reads are wrapped in try/except; failures return defaults rather than crashing
 

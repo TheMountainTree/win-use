@@ -6,7 +6,6 @@ setup(
     packages=find_packages(),
     install_requires=[
         "uiautomation>=2.0",
-        "typer>=0.9",
         "Pillow>=9.0",
         "pyautogui",
         "pyperclip",
